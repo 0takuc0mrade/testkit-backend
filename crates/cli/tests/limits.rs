@@ -155,6 +155,68 @@ fn limits_reports_refinement_audit_and_limitations_in_stdout() {
         ),
         "stdout missing measurement limitations: {stdout}"
     );
+    // #492: failures are reported with a standardized category.
+    assert!(
+        stdout.contains("first failed recipients value:"),
+        "stdout missing first failure: {stdout}"
+    );
+    assert!(
+        stdout.contains("probe failures:"),
+        "stdout missing probe failure categories: {stdout}"
+    );
+}
+
+#[test]
+fn limits_text_summary_and_json_export_agree_on_the_boundary() {
+    // #490: the terminal summary and the machine-readable report are both
+    // rendered from one summary, so the discovered boundary and the
+    // standardized failure category must match exactly.
+    let wasm = ensure_vault_wasm();
+    let temp_dir = std::env::temp_dir().join(format!("stk-limits-agree-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let export_path = temp_dir.join("agreement.json");
+
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--export",
+        export_path.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout: {stdout}");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&export_path).unwrap()).unwrap();
+    let best = json["best"].as_u64().unwrap();
+
+    assert!(
+        stdout.contains(&format!(
+            "last successful recipients for \"batch_payout\": {best}"
+        )),
+        "stdout boundary disagrees with JSON: {stdout}"
+    );
+    assert_eq!(json["audit"]["final_success"], best);
+
+    // The standardized failure category must appear identically in both.
+    let category = match json["first_failure_category"].as_str() {
+        Some(category) => category,
+        None => panic!("JSON is missing first_failure_category: {json}"),
+    };
+    assert!(
+        stdout.contains(&format!("[{category}]")),
+        "stdout is missing standardized category {category}: {stdout}"
+    );
+    assert!(
+        json["probe_failure_counts"][category].as_u64().unwrap() >= 1,
+        "JSON failure counts are missing {category}: {json}"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
