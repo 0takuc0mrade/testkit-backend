@@ -2,4 +2,4 @@
 
 mod sac;
 
-pub use sac::TestToken;
+pub use sac::{base_to_whole_units, whole_to_base_units, TestToken};

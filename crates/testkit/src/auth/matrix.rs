@@ -57,6 +57,22 @@ impl<'a> AuthMatrix<'a> {
         self
     }
 
+    /// Reset all authorization entries and mock authorizations in the test environment.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::auth::AuthMatrix;
+    ///
+    /// let env = TestEnv::new();
+    /// let matrix = AuthMatrix::new(&env);
+    /// matrix.reset_auth();
+    /// ```
+    pub fn reset_auth(&self) {
+        self.env.env().set_auths(&[]);
+    }
+
     /// For every registered entry point, assert every allowed address
     /// succeeds and every other address known to the matrix (i.e. named as
     /// `allowed` on *some* entry point) fails.
@@ -106,7 +122,17 @@ impl<'a> AuthMatrix<'a> {
             grid.push_str(&format!("  [{}]\n", ep.name));
             for addr in &known {
                 let expected = ep.allowed.contains(addr);
-                let actual = (ep.invoke)(addr).is_ok();
+                // Reset auth state before invoking this actor case so that
+                // previously mocked or recorded auths do not leak into it.
+                self.reset_auth();
+                let actual = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (ep.invoke)(addr).is_ok()
+                }))
+                .unwrap_or(false);
+                // Reset auth state immediately after invocation to keep the
+                // slate clean for the next actor case.
+                self.reset_auth();
+
                 grid.push_str(&format!(
                     "    {addr:?}: expected={} actual={}{}\n",
                     if expected { "pass" } else { "reject" },
@@ -143,6 +169,20 @@ impl<'a> AuthMatrix<'a> {
 }
 
 impl TestEnv {
+    /// Reset any active authorizations or mocked auths in this environment.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// env.reset_auth();
+    /// ```
+    pub fn reset_auth(&self) {
+        self.env().set_auths(&[]);
+    }
+
     /// Assert that `f` fails when it runs without the authorization it
     /// requires — the single-call counterpart to [`AuthMatrix`], for a
     /// caller that just needs "this must reject an unauthorized attempt"
@@ -163,7 +203,9 @@ impl TestEnv {
     /// env.assert_requires_auth(|| {});
     /// ```
     pub fn assert_requires_auth(&self, f: impl FnOnce()) {
+        self.reset_auth();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        self.reset_auth();
         if result.is_ok() {
             panic!(
                 "{}",
