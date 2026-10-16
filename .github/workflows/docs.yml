@@ -28,13 +28,20 @@ jobs:
             fi
           fi
 
-      - name: Compatibility matrix documents the pinned soroban-sdk version
+      - name: Compatibility matrix documents the pinned soroban-sdk version without stale claims
         run: |
           sdk="$(sed -n 's/^soroban-sdk = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           grep -Fq "soroban-sdk" COMPATIBILITY.md \
             || { echo "COMPATIBILITY.md does not mention soroban-sdk."; exit 1; }
           grep -Fq "$sdk" COMPATIBILITY.md \
             || { echo "COMPATIBILITY.md does not list the pinned soroban-sdk version ($sdk); update it in the same commit as the pin."; exit 1; }
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          grep -Fq "$version" COMPATIBILITY.md \
+            || { echo "COMPATIBILITY.md does not list the current workspace version ($version)."; exit 1; }
+          spec="$(sed -n 's/^soroban-spec = "\(.*\)"/\1/p' crates/cli/Cargo.toml | head -1)"
+          if [ -n "$spec" ] && [ "$spec" != "$sdk" ]; then
+            echo "crates/cli/Cargo.toml pinned soroban-spec ($spec) does not match workspace soroban-sdk ($sdk); update both on SDK bump."; exit 1;
+          fi
 
       - name: README links the process docs
         run: |

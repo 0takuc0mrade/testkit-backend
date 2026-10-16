@@ -158,3 +158,82 @@ fn audit_json_output_reports_findings_in_a_temp_crate() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn audit_sarif_output_reports_findings_and_rules() {
+    let root = std::env::temp_dir().join(format!("stk-audit-sarif-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/vault.rs"), UNAUTHORIZED_ENTRY_POINT).unwrap();
+
+    let output = run(&["audit", root.to_str().unwrap(), "--format", "sarif"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["version"], "2.1.0");
+    assert_eq!(report["runs"][0]["tool"]["driver"]["name"], "soroban-testkit");
+    let results = report["runs"][0]["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0]["ruleId"], "missing-require-auth");
+    assert!(results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        .as_str()
+        .unwrap()
+        .contains("vault.rs"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn audit_diagnostic_formats_agree_on_finding_counts() {
+    let root = std::env::temp_dir().join(format!("stk-audit-diag-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/vault.rs"), UNAUTHORIZED_ENTRY_POINT).unwrap();
+
+    let text_out = run(&["audit", root.to_str().unwrap(), "--format", "text"]);
+    let json_out = run(&["audit", root.to_str().unwrap(), "--format", "json"]);
+    let sarif_out = run(&["audit", root.to_str().unwrap(), "--format", "sarif"]);
+
+    assert!(text_out.status.success());
+    assert!(json_out.status.success());
+    assert!(sarif_out.status.success());
+
+    let json_report: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    let json_count = json_report["summary"]["finding_count"].as_u64().unwrap();
+
+    let sarif_report: serde_json::Value = serde_json::from_slice(&sarif_out.stdout).unwrap();
+    let sarif_count = sarif_report["runs"][0]["results"].as_array().unwrap().len() as u64;
+
+    assert_eq!(json_count, sarif_count);
+
+    let text_str = String::from_utf8_lossy(&text_out.stdout);
+    assert!(text_str.contains(&format!("{json_count} finding(s)")));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn audit_formats_handle_clean_crate_consistently() {
+    let root = std::env::temp_dir().join(format!("stk-audit-clean-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/clean.rs"), "// clean code with no findings\n").unwrap();
+
+    let text_out = run(&["audit", root.to_str().unwrap(), "--format", "text"]);
+    let json_out = run(&["audit", root.to_str().unwrap(), "--format", "json"]);
+    let sarif_out = run(&["audit", root.to_str().unwrap(), "--format", "sarif"]);
+
+    assert!(text_out.status.success());
+    assert!(json_out.status.success());
+    assert!(sarif_out.status.success());
+
+    let text_str = String::from_utf8_lossy(&text_out.stdout);
+    assert!(text_str.contains("audit: no findings"));
+
+    let json_report: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(json_report["summary"]["finding_count"], 0);
+
+    let sarif_report: serde_json::Value = serde_json::from_slice(&sarif_out.stdout).unwrap();
+    assert_eq!(sarif_report["runs"][0]["results"].as_array().unwrap().len(), 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -107,7 +107,11 @@ fn limits_finds_the_real_mainnet_write_ceiling_for_batch_payout() {
         .current_dir(workspace_root())
         .status()
         .expect("failed to build vault.wasm");
-    assert!(build.success());
+    assert!(
+        build.success(),
+        "failed to compile examples/vault for documented wasm target `wasm32v1-none`. \
+         Ensure the target is installed: `rustup target add wasm32v1-none`."
+    );
 
     let wasm = workspace_root().join("target/wasm32v1-none/release/vault.wasm");
     let output = run(&[

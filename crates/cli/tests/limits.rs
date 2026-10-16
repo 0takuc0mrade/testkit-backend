@@ -39,7 +39,11 @@ fn ensure_vault_wasm() -> PathBuf {
             .current_dir(workspace_root())
             .status()
             .expect("failed to build vault.wasm");
-        assert!(build.success(), "failed to build vault.wasm");
+        assert!(
+            build.success(),
+            "failed to compile examples/vault for documented wasm target `wasm32v1-none`. \
+             Ensure the target is installed: `rustup target add wasm32v1-none`."
+        );
     }
     wasm
 }
