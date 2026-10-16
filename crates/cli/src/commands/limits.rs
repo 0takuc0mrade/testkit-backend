@@ -1,3 +1,13 @@
+//! Resource-ceiling discovery for compiled Soroban contracts.
+//!
+//! This module owns the `limits` command and the hidden `__limits-probe`
+//! child entry point it spawns. The two halves cooperate through process
+//! isolation, whose full lifecycle is documented on [`run`]; each probe's
+//! result is classified with [`ProbeFailureCategory`] and every report —
+//! human-readable or machine-readable — is rendered from a single
+//! [`LimitsSummary`] so the formats cannot disagree.
+
+use std::collections::BTreeMap;
 use std::panic;
 use std::path::Path;
 use std::process::Command;
@@ -15,12 +25,201 @@ use super::CliError;
 pub const MEASUREMENT_LIMITATIONS: &str =
     "ledger reads/writes and transaction size are not measured by this command; see --help";
 
+/// Built-in upper bound for the doubling search. If the contract still
+/// succeeds here the run stops and reports that the ceiling may be higher,
+/// rather than ramping forever.
+pub const SEARCH_UPPER_BOUND: u32 = 1 << 24;
+
+/// The standardized reason a single probe did not succeed.
+///
+/// Every failure category is reported verbatim in the human-readable summary,
+/// the refinement audit, and the JSON export, so a failure can be triaged the
+/// same way regardless of which output format a CI job happens to consume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbeFailureCategory {
+    /// The child process ran to completion and exited non-zero: the contract
+    /// either rejected the ramp value with its own validation error or
+    /// exhausted a host resource budget.
+    ExitFailure,
+    /// The probe exceeded `--probe-timeout` and was killed by the parent
+    /// before it could finish.
+    TimedOut,
+    /// The child process was terminated by a signal — the host abort that
+    /// real WASM execution can cause rather than a normal exit. On such a
+    /// run the failure is real, but the ramp value reported may reflect the
+    /// abort rather than a clean resource boundary.
+    Abort,
+    /// The isolated probe process could not be spawned at all; this is a
+    /// host/tooling problem, not a statement about the contract.
+    SpawnFailure,
+}
+
+impl ProbeFailureCategory {
+    /// The stable, machine-readable category name (also the JSON key).
+    pub fn label(self) -> &'static str {
+        match self {
+            ProbeFailureCategory::ExitFailure => "exit-failure",
+            ProbeFailureCategory::TimedOut => "timed-out",
+            ProbeFailureCategory::Abort => "abort",
+            ProbeFailureCategory::SpawnFailure => "spawn-failure",
+        }
+    }
+
+    /// A one-line, actionable explanation of what the category implies for
+    /// the discovered ceiling.
+    pub fn guidance(self) -> &'static str {
+        match self {
+            ProbeFailureCategory::ExitFailure => {
+                "the contract rejected this value or exhausted a resource budget; this is the normal ceiling signal"
+            }
+            ProbeFailureCategory::TimedOut => {
+                "raise --probe-timeout to confirm whether the ceiling reflects a hang or a real resource limit"
+            }
+            ProbeFailureCategory::Abort => {
+                "the host aborted during WASM execution; re-run to confirm the boundary is stable"
+            }
+            ProbeFailureCategory::SpawnFailure => {
+                "relocate/reinstall the soroban-testkit binary because probes could not be spawned"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ProbeFailureCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label())
+    }
+}
+
+/// The outcome of a single isolated probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// The probe exited zero: the ramp value is supported.
+    Succeeded,
+    /// The probe failed, classified for the report.
+    Failed(ProbeFailureCategory),
+}
+
+impl ProbeOutcome {
+    /// Whether the probe succeeded, for the binary search's yes/no decision.
+    pub fn succeeded(self) -> bool {
+        matches!(self, ProbeOutcome::Succeeded)
+    }
+}
+
+/// `serde(skip_serializing_if)` helper: omitted for an empty failure map.
+fn map_is_empty<K, V>(map: &BTreeMap<K, V>) -> bool {
+    map.is_empty()
+}
+
+/// The single source of truth for one `limits` run.
+///
+/// The terminal summary ([`LimitsSummary::render_text`]) and the JSON export
+/// ([`export_results`]) are both rendered from this value, so the two formats
+/// can never disagree about the discovered boundary, the failing value, or
+/// why probes failed.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LimitsSummary {
+    /// Sanitized contract path (see [`sanitize_report_path`]).
+    pub contract: String,
+    pub function: String,
+    pub ramp: String,
+    /// The highest ramp value that succeeded.
+    pub best: u32,
+    /// CPU instructions consumed at `best`.
+    pub instructions: u64,
+    /// Memory bytes consumed at `best`.
+    pub memory_bytes: u64,
+    /// The first ramp value that failed, if one was found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_failed: Option<u32>,
+    /// Why that first failure happened, standardized for every report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_failure_category: Option<ProbeFailureCategory>,
+    /// How many probes failed in each category over the whole run.
+    #[serde(skip_serializing_if = "map_is_empty")]
+    pub probe_failure_counts: BTreeMap<ProbeFailureCategory, usize>,
+    /// Whether the search stopped at [`SEARCH_UPPER_BOUND`] without finding a
+    /// failure.
+    pub hit_upper_bound: bool,
+    /// Per-probe timeout the run used, for the timeout guidance line.
+    pub probe_timeout_secs: u64,
+    /// Boundary-refinement audit trail, when a failure was bracketed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit: Option<RefinementAudit>,
+    pub measurement_limitations: String,
+}
+
+impl LimitsSummary {
+    /// Renders the human-readable summary. This is the only place the text
+    /// output is produced, keeping it in lockstep with the JSON export.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "last successful {} for {:?}: {}\n",
+            self.ramp, self.function, self.best
+        ));
+        out.push_str(&format!("  instructions: {}\n", self.instructions));
+        out.push_str(&format!("  memory bytes: {}\n", self.memory_bytes));
+        if let Some(failed) = self.first_failed {
+            out.push_str(&format!("  first failed {} value: {failed}", self.ramp));
+            if let Some(category) = self.first_failure_category {
+                out.push_str(&format!(" [{category}]"));
+            }
+            out.push('\n');
+        }
+        if !self.probe_failure_counts.is_empty() {
+            let counts = self
+                .probe_failure_counts
+                .iter()
+                .map(|(category, count)| format!("{category}: {count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("  probe failures: {counts}\n"));
+        }
+        if let Some(audit) = &self.audit {
+            out.push_str(&format!(
+                "  boundary refinement: probed {} values between {} and {} (final boundary: [{}, {}])\n",
+                audit.steps.len(),
+                audit.initial_low,
+                audit.initial_high,
+                audit.final_success,
+                audit.final_failure,
+            ));
+        }
+        out.push_str(&format!("  ({})\n", self.measurement_limitations));
+        if self.hit_upper_bound {
+            out.push_str(&format!(
+                "  note: search stopped at the built-in upper bound ({SEARCH_UPPER_BOUND}); the \
+                 contract may support higher ramp values\n"
+            ));
+        }
+        if self
+            .probe_failure_counts
+            .contains_key(&ProbeFailureCategory::TimedOut)
+        {
+            out.push_str(&format!(
+                "  note: at least one probe was killed for exceeding --probe-timeout ({}s); the \
+                 discovered ceiling may reflect a hang rather than a real resource limit — rerun \
+                 with a larger --probe-timeout to check\n",
+                self.probe_timeout_secs
+            ));
+        }
+        out
+    }
+}
+
 /// A single step in a numeric boundary refinement search.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RefinementStep {
     pub step: usize,
     pub probe_value: u32,
     pub succeeded: bool,
+    /// Why the probe failed, when it did. Uses the standardized
+    /// [`ProbeFailureCategory`] vocabulary so every report agrees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<ProbeFailureCategory>,
     pub window_low: u32,
     pub window_high: u32,
 }
@@ -103,7 +302,7 @@ pub struct ProbeArgs {
 /// until it fails, then reports the last successful value plus the CPU
 /// instructions and memory consumed at that point.
 ///
-/// # Why this spawns a subprocess per attempt
+/// # Subprocess isolation lifecycle
 ///
 /// Ramping deliberately drives a real, compiled `.wasm` contract past its
 /// resource limits. Verified empirically: when that failure happens
@@ -112,11 +311,36 @@ pub struct ProbeArgs {
 /// (`thread caused non-unwinding panic. aborting.`) rather than return an
 /// error or unwind — neither `catch_unwind` nor `try_invoke_contract`
 /// (the SDK's own no-panic call path) prevents this for the WASM target.
-/// So each attempt runs in its own child process (`soroban-testkit
-/// __limits-probe`, hidden from `--help`): if that child aborts, only the
-/// child dies, and the exit code alone tells this command whether that
-/// ramp value succeeded. Each probe's temporary environment is cleaned up
-/// immediately after the probe completes or times out.
+/// A probe is therefore never invoked in-process. The full lifecycle is:
+///
+/// 1. **Validate first, in-process.** [`load`] and [`build_args`] check the
+///    function spec, the ramp parameter, and every other parameter's type
+///    before any child is spawned. This is type/spec checking, not WASM
+///    execution, so it carries none of the abort risk above and a typo'd
+///    `--fn`/`--ramp` reports its real cause instead of a generic probe
+///    failure.
+/// 2. **Spawn one child per probe.** The parent re-executes itself as
+///    `soroban-testkit __limits-probe` (hidden from `--help`) with the
+///    ramp value passed through `--value`. See [`run_probe`] for the child
+///    half. The child's `Env` is a throwaway registered from the `.wasm`
+///    and is dropped when the child exits, so no state leaks between
+///    probes.
+/// 3. **Bound the probe.** The parent waits up to `--probe-timeout` in
+///    [`wait_with_timeout`]. If the child finishes, its exit status decides
+///    the outcome; if it overruns, the parent kills it and records a
+///    [`ProbeFailureCategory::TimedOut`]. A child terminated by a signal
+///    (the host abort above) is recorded as [`ProbeFailureCategory::Abort`].
+/// 4. **Classify and search.** Every outcome is classified with
+///    [`ProbeFailureCategory`]; the parent doubles to bracket the first
+///    failure and then binary-searches with
+///    [`refine_upper_bound_audited`], recording each probe's category.
+/// 5. **Report once.** The collected results are assembled into a single
+///    [`LimitsSummary`] that renders both the terminal output and the JSON
+///    export, so the two can never disagree.
+///
+/// If the parent cannot spawn a child at all, that is surfaced as a
+/// [`ProbeFailureCategory::SpawnFailure`] with guidance to reinstall the
+/// binary, rather than being mistaken for a contract ceiling.
 ///
 /// # Scope
 ///
@@ -156,11 +380,12 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         .map_err(|err| CliError(format!("failed to locate this binary: {err}")))?;
 
     let probe_timeout = Duration::from_secs(args.probe_timeout);
-    let mut any_probe_timed_out = false;
+    let mut probe_failure_counts: BTreeMap<ProbeFailureCategory, usize> = BTreeMap::new();
     let mut last_failed_probe: Option<u32> = None;
+    let mut last_failure_category: Option<ProbeFailureCategory> = None;
     let mut hit_upper_bound = false;
 
-    let mut probe = |value: u32| -> Result<bool, CliError> {
+    let mut probe = |value: u32| -> Result<ProbeOutcome, CliError> {
         let mut child = Command::new(&self_exe)
             .arg("__limits-probe")
             .arg("--contract")
@@ -179,46 +404,70 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|err| CliError(format!("failed to spawn probe: {err}")))?;
+            .map_err(|err| {
+                CliError(format!(
+                    "failed to spawn the isolated probe process for ramp value {value}: {err}; \
+                     verify the soroban-testkit binary is intact and re-run \
+                     ({})",
+                    ProbeFailureCategory::SpawnFailure.guidance()
+                ))
+            })?;
 
-        match wait_with_timeout(&mut child, probe_timeout)? {
-            Some(status) => Ok(status.success()),
-            None => {
-                any_probe_timed_out = true;
-                Ok(false)
+        let outcome = match wait_with_timeout(&mut child, probe_timeout)? {
+            Some(status) if status.success() => ProbeOutcome::Succeeded,
+            // A signal-terminated child has no exit code; that is the host
+            // abort this command exists to survive, not a normal rejection.
+            Some(status) if status.code().is_none() => {
+                ProbeOutcome::Failed(ProbeFailureCategory::Abort)
             }
+            Some(_) => ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure),
+            None => ProbeOutcome::Failed(ProbeFailureCategory::TimedOut),
+        };
+        if let ProbeOutcome::Failed(category) = outcome {
+            *probe_failure_counts.entry(category).or_insert(0) += 1;
         }
+        Ok(outcome)
     };
 
     // Find a failing upper bound by doubling.
     let mut last_ok: Option<u32> = None;
     let mut low = 1u32;
     let mut high = None;
-    const UPPER_BOUND: u32 = 1 << 24;
     loop {
-        if probe(low)? {
-            last_ok = Some(low);
-            match low.checked_mul(2) {
-                Some(next) => low = next,
-                None => {
-                    high = None;
-                    break;
+        match probe(low)? {
+            ProbeOutcome::Succeeded => {
+                last_ok = Some(low);
+                match low.checked_mul(2) {
+                    Some(next) => low = next,
+                    None => {
+                        high = None;
+                        break;
+                    }
                 }
             }
-        } else {
-            last_failed_probe = Some(low);
-            high = Some(low);
-            break;
+            ProbeOutcome::Failed(category) => {
+                last_failed_probe = Some(low);
+                last_failure_category = Some(category);
+                high = Some(low);
+                break;
+            }
         }
-        if low > UPPER_BOUND {
+        if low > SEARCH_UPPER_BOUND {
             hit_upper_bound = true;
             break;
         }
     }
 
     let Some(last_ok) = last_ok else {
+        let category_note = match last_failure_category {
+            Some(category) => format!(
+                "; probe failure category: {category} ({})",
+                category.guidance()
+            ),
+            None => String::new(),
+        };
         return Err(CliError(format!(
-            "{:?} failed even at the smallest ramp value (1) for parameter {:?}; \
+            "{:?} failed even at the smallest ramp value (1) for parameter {:?}{category_note}; \
              this usually indicates a validation error in the contract rather than a \
              resource limit — check the contract's parameter validation logic and retry",
             args.function, args.ramp
@@ -228,12 +477,24 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     // Binary search between the last success and the first failure for a
     // tighter bound, if we found one.
     let mut best = last_ok;
+    let mut first_failed = last_failed_probe;
+    let mut first_failure_category = last_failure_category;
     let mut refinement_audit = None;
     if let Some(hi_start) = high {
         let (last_success, first_failure, audit) =
             refine_upper_bound_audited(last_ok, hi_start, &mut probe)?;
         best = last_success;
-        last_failed_probe = Some(first_failure);
+        first_failed = Some(first_failure);
+        // The value that set the final upper bound is the last failing step,
+        // so its category is the standardized reason for the boundary. Fall
+        // back to the doubling probe's category if refinement took no steps.
+        first_failure_category = audit
+            .steps
+            .iter()
+            .rev()
+            .find(|step| !step.succeeded)
+            .and_then(|step| step.failure_category)
+            .or(last_failure_category);
         refinement_audit = Some(audit);
     }
 
@@ -241,41 +502,22 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     // time (a known-successful call is safe to make directly).
     let (instructions, memory_bytes) = measure(&args, best)?;
 
-    println!(
-        "last successful {} for {:?}: {best}",
-        args.ramp, args.function
-    );
-    println!("  instructions: {instructions}");
-    println!("  memory bytes: {memory_bytes}");
-    if let Some(failed) = last_failed_probe {
-        println!("  first failed {} value: {failed}", args.ramp);
-    }
-    if let Some(audit) = &refinement_audit {
-        println!(
-            "  boundary refinement: probed {} values between {} and {} (final boundary: [{}, {}])",
-            audit.steps.len(),
-            audit.initial_low,
-            audit.initial_high,
-            audit.final_success,
-            audit.final_failure,
-        );
-    }
-    println!("  ({MEASUREMENT_LIMITATIONS})");
-    if hit_upper_bound {
-        println!(
-            "  note: search stopped at the built-in upper bound ({}); the contract may support \
-             higher ramp values",
-            UPPER_BOUND
-        );
-    }
-    if any_probe_timed_out {
-        println!(
-            "  note: at least one probe was killed for exceeding --probe-timeout ({}s); the \
-             discovered ceiling may reflect a hang rather than a real resource limit — rerun \
-             with a larger --probe-timeout to check",
-            args.probe_timeout
-        );
-    }
+    let summary = LimitsSummary {
+        contract: sanitize_report_path(&args.contract),
+        function: args.function.clone(),
+        ramp: args.ramp.clone(),
+        best,
+        instructions,
+        memory_bytes,
+        first_failed,
+        first_failure_category,
+        probe_failure_counts,
+        hit_upper_bound,
+        probe_timeout_secs: args.probe_timeout,
+        audit: refinement_audit,
+        measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
+    };
+    print!("{}", summary.render_text());
 
     if let Some(baseline_path) = &args.baseline {
         compare_to_baseline(
@@ -301,16 +543,7 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         println!("saved baseline to {}", save_path.display());
     }
     if let Some(export_path) = &args.export {
-        export_results(
-            export_path,
-            &args.contract,
-            &args.ramp,
-            &args.function,
-            best,
-            instructions,
-            memory_bytes,
-            refinement_audit.as_ref(),
-        )?;
+        export_results(export_path, &summary)?;
         println!("exported results to {}", export_path.display());
     }
 
@@ -327,14 +560,15 @@ fn validate_percentage(name: &str, pct: f64) -> Result<(), CliError> {
 }
 
 /// Refines the boundary between a known success (`low`) and a known failure (`high`)
-/// using binary search, recording every intermediate step in a [`RefinementAudit`].
+/// using binary search, recording every intermediate step in a [`RefinementAudit`]
+/// — including the standardized [`ProbeFailureCategory`] of each failing step.
 pub fn refine_upper_bound_audited<F>(
     mut low: u32,
     mut high: u32,
     probe: &mut F,
 ) -> Result<(u32, u32, RefinementAudit), CliError>
 where
-    F: FnMut(u32) -> Result<bool, CliError>,
+    F: FnMut(u32) -> Result<ProbeOutcome, CliError>,
 {
     if low >= high {
         return Err(CliError(format!(
@@ -349,7 +583,12 @@ where
 
     while low.saturating_add(1) < high {
         let middle = low + (high - low) / 2;
-        let succeeded = probe(middle)?;
+        let outcome = probe(middle)?;
+        let succeeded = outcome.succeeded();
+        let failure_category = match outcome {
+            ProbeOutcome::Succeeded => None,
+            ProbeOutcome::Failed(category) => Some(category),
+        };
         if succeeded {
             low = middle;
         } else {
@@ -359,6 +598,7 @@ where
             step: step_num,
             probe_value: middle,
             succeeded,
+            failure_category,
             window_low: low,
             window_high: high,
         });
@@ -376,18 +616,36 @@ where
     Ok((low, high, audit))
 }
 
+/// Bool-returning convenience wrapper around [`refine_upper_bound_audited`],
+/// retained for callers (and tests) that only care about success/failure.
+/// A `false` probe is classified as [`ProbeFailureCategory::ExitFailure`],
+/// the category the isolated probe reports for a clean non-zero exit.
 #[allow(dead_code)]
 pub fn refine_upper_bound<F>(low: u32, high: u32, probe: &mut F) -> Result<(u32, u32), CliError>
 where
     F: FnMut(u32) -> Result<bool, CliError>,
 {
-    let (success, failure, _) = refine_upper_bound_audited(low, high, probe)?;
+    let (success, failure, _) = refine_upper_bound_audited(low, high, &mut |value| {
+        Ok(if probe(value)? {
+            ProbeOutcome::Succeeded
+        } else {
+            ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure)
+        })
+    })?;
     Ok((success, failure))
 }
 
-/// The hidden probe entry point: performs exactly one invocation and
-/// returns `Ok(())` (exit 0) or `Err` (exit 1) — no measurement, no
-/// output. Run in its own process by [`run`].
+/// The hidden child half of the isolation lifecycle documented on [`run`]:
+/// performs exactly one invocation in a throwaway [`Env`] registered from
+/// the `.wasm` and returns `Ok(())` (exit 0) or `Err` (exit 1) — no
+/// measurement, no output. Because the child dies after a single call, the
+/// parent can classify an abort by signal without losing its own run.
+///
+/// The child only ever reports success/failure through its exit status; the
+/// parent turns that status into a [`ProbeFailureCategory`]. Failures that
+/// happen *before* invocation (an unreadable contract, a bad ramp value)
+/// come back as an actionable [`CliError`] message, but the parent's
+/// pre-validation normally catches those first.
 pub fn run_probe(args: ProbeArgs) -> Result<(), CliError> {
     let _quiet = QuietPanics::install();
     let (contract_id, env, function, ramp_index) =
@@ -404,7 +662,11 @@ pub fn run_probe(args: ProbeArgs) -> Result<(), CliError> {
 /// Waits up to `timeout` for `child` to exit, polling rather than blocking
 /// so an exceeded timeout can kill it instead of waiting forever. Returns
 /// `Some(status)` on a normal exit within the timeout, or `None` if the
-/// child was killed for running too long.
+/// child was killed for running too long — which the caller classifies as
+/// [`ProbeFailureCategory::TimedOut`]. A status with no exit code means the
+/// child was terminated by a signal ([`ProbeFailureCategory::Abort`]).
+/// Killing and reaping here is what guarantees a timed-out probe's
+/// temporary environment does not outlive the probe.
 fn wait_with_timeout(
     child: &mut std::process::Child,
     timeout: Duration,
@@ -688,34 +950,15 @@ fn compare_to_baseline(
     )))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn export_results(
-    path: &Path,
-    contract: &Path,
-    ramp: &str,
-    function: &str,
-    best: u32,
-    instructions: u64,
-    memory_bytes: u64,
-    audit: Option<&RefinementAudit>,
-) -> Result<(), CliError> {
-    let sanitized_contract = sanitize_report_path(contract);
-
+/// Writes `summary` to `path` in the format implied by its extension:
+/// pretty JSON for `.json`, otherwise the flat `key=value` baseline format.
+///
+/// Both branches are rendered from the same [`LimitsSummary`] the terminal
+/// output uses, so a boundary or failure category can never differ between
+/// what a human sees and what CI reads back.
+pub fn export_results(path: &Path, summary: &LimitsSummary) -> Result<(), CliError> {
     if path.extension().is_some_and(|ext| ext == "json") {
-        let mut report = serde_json::json!({
-            "contract": sanitized_contract,
-            "function": function,
-            "ramp": ramp,
-            "best": best,
-            "instructions": instructions,
-            "memory_bytes": memory_bytes,
-            "measurement_limitations": MEASUREMENT_LIMITATIONS,
-        });
-        if let Some(audit) = audit {
-            report["audit"] = serde_json::to_value(audit)
-                .map_err(|err| CliError(format!("failed to serialize audit to JSON: {err}")))?;
-        }
-        let json_str = serde_json::to_string_pretty(&report)
+        let json_str = serde_json::to_string_pretty(summary)
             .map_err(|err| CliError(format!("failed to format JSON export: {err}")))?;
         std::fs::write(path, json_str).map_err(|err| {
             CliError(format!(
@@ -725,13 +968,13 @@ pub fn export_results(
         })
     } else {
         let baseline = Baseline {
-            contract: Some(sanitized_contract),
-            function: function.to_string(),
-            ramp: ramp.to_string(),
-            best,
-            instructions,
-            memory_bytes,
-            measurement_limitations: Some(MEASUREMENT_LIMITATIONS.to_string()),
+            contract: Some(summary.contract.clone()),
+            function: summary.function.clone(),
+            ramp: summary.ramp.clone(),
+            best: summary.best,
+            instructions: summary.instructions,
+            memory_bytes: summary.memory_bytes,
+            measurement_limitations: Some(summary.measurement_limitations.clone()),
         };
         std::fs::write(path, baseline.to_file_contents()).map_err(|err| {
             CliError(format!(
@@ -750,10 +993,12 @@ fn measure(args: &LimitsArgs, value: u32) -> Result<(u64, u64), CliError> {
     budget.reset_default();
     let args_vec = build_args(&env, &function, ramp_index, value, &args.arg_values)?;
     if !invoke_succeeds(&env, &contract_id, &func, args_vec) {
-        return Err(CliError(
-            "internal error: the ramp value chosen as successful failed on re-measurement"
-                .to_string(),
-        ));
+        return Err(CliError(format!(
+            "internal error: {:?} reported ramp value {value} as successful during probing \
+             but failed on in-process re-measurement for parameter {:?}; re-run to confirm the \
+             boundary is stable, or lower --probe-timeout if the run is racing a hang",
+            args.function, args.ramp
+        )));
     }
     Ok((budget.cpu_instruction_cost(), budget.memory_bytes_cost()))
 }
@@ -1124,6 +1369,7 @@ fn default_val(
 mod tests {
     use super::*;
     use soroban_sdk::xdr::ScSpecTypeVec;
+    use std::collections::BTreeMap;
 
     // ---- #239: Vec<T> ramp support ----
 
@@ -1229,6 +1475,33 @@ mod tests {
             instructions: 1_000_000,
             memory_bytes: 50_000,
             measurement_limitations: Some(MEASUREMENT_LIMITATIONS.to_string()),
+        }
+    }
+
+    fn sample_summary() -> LimitsSummary {
+        LimitsSummary {
+            contract: "vault.wasm".to_string(),
+            function: "batch_payout".to_string(),
+            ramp: "recipients".to_string(),
+            best: 100,
+            instructions: 1_000_000,
+            memory_bytes: 50_000,
+            first_failed: Some(101),
+            first_failure_category: Some(ProbeFailureCategory::ExitFailure),
+            probe_failure_counts: BTreeMap::from([(ProbeFailureCategory::ExitFailure, 1)]),
+            hit_upper_bound: false,
+            probe_timeout_secs: 30,
+            audit: None,
+            measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
+        }
+    }
+
+    /// A summary whose contract field went through [`sanitize_report_path`],
+    /// mirroring what `run` stores before exporting.
+    fn summary_for_contract(contract: &Path) -> LimitsSummary {
+        LimitsSummary {
+            contract: sanitize_report_path(contract),
+            ..sample_summary()
         }
     }
 
@@ -1417,17 +1690,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("export.results");
 
-        export_results(
-            &path,
-            Path::new("vault.wasm"),
-            "recipients",
-            "batch_payout",
-            100,
-            1_000_000,
-            50_000,
-            None,
-        )
-        .unwrap();
+        export_results(&path, &sample_summary()).unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("contract=vault.wasm"));
@@ -1447,17 +1710,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("export.results");
 
-        export_results(
-            &path,
-            Path::new("vault.wasm"),
-            "recipients",
-            "batch_payout",
-            100,
-            1_000_000,
-            50_000,
-            None,
-        )
-        .unwrap();
+        export_results(&path, &sample_summary()).unwrap();
 
         let baseline = Baseline::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(baseline.contract, Some("vault.wasm".to_string()));
@@ -1500,17 +1753,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("my export results.txt");
 
-        export_results(
-            &path,
-            Path::new("vault.wasm"),
-            "recipients",
-            "batch_payout",
-            100,
-            1_000_000,
-            50_000,
-            None,
-        )
-        .unwrap();
+        export_results(&path, &summary_for_contract(Path::new("vault.wasm"))).unwrap();
 
         let baseline = Baseline::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(baseline.contract, Some("vault.wasm".to_string()));
@@ -1616,7 +1859,11 @@ mod tests {
         let mut probed = Vec::new();
         let (success, failure, audit) = refine_upper_bound_audited(10, 30, &mut |value| {
             probed.push(value);
-            Ok(value <= 23)
+            Ok(if value <= 23 {
+                ProbeOutcome::Succeeded
+            } else {
+                ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure)
+            })
         })
         .unwrap();
 
@@ -1631,7 +1878,47 @@ mod tests {
             assert_eq!(step.step, i + 1);
             assert_eq!(step.probe_value, probed[i]);
             assert_eq!(step.succeeded, probed[i] <= 23);
+            // Every failing step carries the standardized category; every
+            // succeeding step carries none.
+            assert_eq!(
+                step.failure_category,
+                (!step.succeeded).then_some(ProbeFailureCategory::ExitFailure)
+            );
         }
+    }
+
+    // ---- #492: standardized probe failure categories ----
+
+    #[test]
+    fn probe_failure_categories_have_stable_labels_and_guidance() {
+        let expected = [
+            (ProbeFailureCategory::ExitFailure, "exit-failure"),
+            (ProbeFailureCategory::TimedOut, "timed-out"),
+            (ProbeFailureCategory::Abort, "abort"),
+            (ProbeFailureCategory::SpawnFailure, "spawn-failure"),
+        ];
+        for (category, label) in expected {
+            assert_eq!(category.label(), label);
+            assert_eq!(category.to_string(), label);
+            assert!(
+                !category.guidance().is_empty(),
+                "category {label} must carry actionable guidance"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_failure_categories_serialize_as_stable_kebab_case_strings() {
+        let json = serde_json::to_value(ProbeFailureCategory::TimedOut).unwrap();
+        assert_eq!(json, serde_json::json!("timed-out"));
+        let parsed: ProbeFailureCategory = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, ProbeFailureCategory::TimedOut);
+    }
+
+    #[test]
+    fn probe_outcome_reports_success_only_for_succeeded() {
+        assert!(ProbeOutcome::Succeeded.succeeded());
+        assert!(!ProbeOutcome::Failed(ProbeFailureCategory::Abort).succeeded());
     }
 
     #[test]
@@ -1709,17 +1996,7 @@ mod tests {
         let path = dir.join("report.json");
         let temp_contract = dir.join("run-pid-999/vault.wasm");
 
-        export_results(
-            &path,
-            &temp_contract,
-            "recipients",
-            "batch_payout",
-            100,
-            1_000_000,
-            50_000,
-            None,
-        )
-        .unwrap();
+        export_results(&path, &summary_for_contract(&temp_contract)).unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
@@ -1840,6 +2117,7 @@ mod tests {
                 step: 1,
                 probe_value: 15,
                 succeeded: true,
+                failure_category: None,
                 window_low: 15,
                 window_high: 20,
             }],
@@ -1847,17 +2125,18 @@ mod tests {
             final_failure: 16,
         };
 
-        export_results(
-            &path,
-            Path::new("vault.wasm"),
-            "recipients",
-            "batch_payout",
-            15,
-            500_000,
-            25_000,
-            Some(&audit),
-        )
-        .unwrap();
+        let summary = LimitsSummary {
+            best: 15,
+            instructions: 500_000,
+            memory_bytes: 25_000,
+            first_failed: Some(16),
+            first_failure_category: Some(ProbeFailureCategory::ExitFailure),
+            probe_failure_counts: BTreeMap::from([(ProbeFailureCategory::ExitFailure, 1)]),
+            audit: Some(audit),
+            ..sample_summary()
+        };
+
+        export_results(&path, &summary).unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
@@ -1869,6 +2148,54 @@ mod tests {
         assert_eq!(parsed["memory_bytes"], 25_000);
         assert_eq!(parsed["measurement_limitations"], MEASUREMENT_LIMITATIONS);
         assert_eq!(parsed["audit"]["steps"].as_array().unwrap().len(), 1);
+        // The standardized failure categories appear in the JSON export.
+        assert_eq!(parsed["first_failed"], 16);
+        assert_eq!(parsed["first_failure_category"], "exit-failure");
+        assert_eq!(parsed["probe_failure_counts"]["exit-failure"], 1);
+    }
+
+    #[test]
+    fn render_text_reports_boundary_categories_and_unifies_with_json() {
+        let summary = LimitsSummary {
+            best: 15,
+            instructions: 500_000,
+            memory_bytes: 25_000,
+            first_failed: Some(16),
+            first_failure_category: Some(ProbeFailureCategory::TimedOut),
+            probe_failure_counts: BTreeMap::from([
+                (ProbeFailureCategory::ExitFailure, 2),
+                (ProbeFailureCategory::TimedOut, 1),
+            ]),
+            audit: Some(RefinementAudit {
+                initial_low: 10,
+                initial_high: 20,
+                steps: vec![RefinementStep {
+                    step: 1,
+                    probe_value: 15,
+                    succeeded: false,
+                    failure_category: Some(ProbeFailureCategory::TimedOut),
+                    window_low: 10,
+                    window_high: 15,
+                }],
+                final_success: 14,
+                final_failure: 15,
+            }),
+            ..sample_summary()
+        };
+
+        let text = summary.render_text();
+        assert!(text.contains("last successful recipients"), "{text}");
+        assert!(text.contains("first failed recipients value: 16 [timed-out]"), "{text}");
+        assert!(text.contains("probe failures: exit-failure: 2, timed-out: 1"), "{text}");
+        assert!(text.contains("boundary refinement: probed 1 values"), "{text}");
+        assert!(text.contains("--probe-timeout (30s)"), "{text}");
+
+        // The same summary serializes the same boundary into JSON, so the
+        // two formats cannot drift apart.
+        let json: serde_json::Value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["best"], 15);
+        assert_eq!(json["first_failure_category"], "timed-out");
+        assert_eq!(json["probe_failure_counts"]["exit-failure"], 2);
     }
 
     #[test]
