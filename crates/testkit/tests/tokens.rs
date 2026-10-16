@@ -15,14 +15,21 @@ fn decimal_scaling_overflow_is_prevented_with_actionable_error() {
     // 2. Excessively large decimal precision (e.g. 40) where 10^40 overflows i128
     let err_prec = whole_to_base_units(1, 40).expect_err("large precision should return Err");
     assert!(err_prec.is_misuse());
-    assert!(err_prec.message().contains("decimal precision 40 is too large"));
+    assert!(err_prec
+        .message()
+        .contains("decimal precision 40 is too large"));
 
-    let err_base = base_to_whole_units(1_000, 40).expect_err("large precision base should return Err");
+    let err_base =
+        base_to_whole_units(1_000, 40).expect_err("large precision base should return Err");
     assert!(err_base.is_misuse());
-    assert!(err_base.message().contains("decimal precision 40 is too large"));
+    assert!(err_base
+        .message()
+        .contains("decimal precision 40 is too large"));
 
     // 3. TestToken methods use checked conversion
-    let err_token = token.to_base_units(i128::MAX).expect_err("token to_base_units overflow");
+    let err_token = token
+        .to_base_units(i128::MAX)
+        .expect_err("token to_base_units overflow");
     assert!(err_token.is_misuse());
 
     // 4. TestToken::mint panics with Misuse instead of integer overflow
@@ -35,7 +42,10 @@ fn decimal_scaling_overflow_is_prevented_with_actionable_error() {
     let assert_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         token.assert_balance_whole(&alice, i128::MAX);
     }));
-    assert!(assert_res.is_err(), "assert_balance_whole with overflow amount should panic");
+    assert!(
+        assert_res.is_err(),
+        "assert_balance_whole with overflow amount should panic"
+    );
 }
 
 #[test]

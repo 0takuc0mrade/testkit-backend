@@ -20,7 +20,7 @@ fn auth_state_is_reset_between_independent_actor_cases() {
     let env = TestEnv::new();
     let contract_id = env.env().register(SecureBank, ());
     let alice = env.address();
-    let bob = env.address();
+    let _bob = env.address();
     let client = SecureBankClient::new(env.env(), &contract_id);
 
     // Build an AuthMatrix where only alice is allowed to call `privileged`.
@@ -32,7 +32,7 @@ fn auth_state_is_reset_between_independent_actor_cases() {
         std::slice::from_ref(&alice),
         |caller: &Address| {
             if *caller == alice {
-                client
+                match client
                     .mock_auths(&[MockAuth {
                         address: caller,
                         invoke: &MockAuthInvoke {
@@ -43,12 +43,15 @@ fn auth_state_is_reset_between_independent_actor_cases() {
                         },
                     }])
                     .try_privileged(caller)
-                    .map_err(|_| soroban_sdk::Error::from_contract_error(1))
+                {
+                    Ok(Ok(())) => Ok(()),
+                    _ => Err(soroban_sdk::Error::from_contract_error(1)),
+                }
             } else {
-                // Bob does not mock auth, so privileged should fail
-                client
-                    .try_privileged(caller)
-                    .map_err(|_| soroban_sdk::Error::from_contract_error(1))
+                match client.try_privileged(caller) {
+                    Ok(Ok(())) => Ok(()),
+                    _ => Err(soroban_sdk::Error::from_contract_error(1)),
+                }
             }
         },
     );

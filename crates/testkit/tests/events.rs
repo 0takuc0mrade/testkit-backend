@@ -68,7 +68,10 @@ fn decode_unknown_topic_value_does_not_panic_in_diagnostics() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         log.assert_emitted(symbol_short!("missing"));
     }));
-    assert!(result.is_err(), "assert_emitted should fail when topic does not match");
+    assert!(
+        result.is_err(),
+        "assert_emitted should fail when topic does not match"
+    );
 }
 
 #[test]

@@ -76,4 +76,3 @@ fn test_no_network_script_preserves_cargo_exit_status() {
         "test-no-network.sh must exit with the original status code of the cargo command."
     );
 }
-

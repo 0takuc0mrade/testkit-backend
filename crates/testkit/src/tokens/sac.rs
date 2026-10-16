@@ -198,12 +198,16 @@ impl TestToken {
             )));
         }
 
-        let new_total = self.total_tracked.get().checked_add(amount).ok_or_else(|| {
-            TestkitError::Misuse(format!(
-                "minting {amount} base units would overflow tracked supply (current total: {})",
-                self.total_tracked.get()
-            ))
-        })?;
+        let new_total = self
+            .total_tracked
+            .get()
+            .checked_add(amount)
+            .ok_or_else(|| {
+                TestkitError::Misuse(format!(
+                    "minting {amount} base units would overflow tracked supply (current total: {})",
+                    self.total_tracked.get()
+                ))
+            })?;
 
         let invoke_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             StellarAssetClient::new(&self.env, &self.address)
