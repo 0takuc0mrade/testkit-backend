@@ -324,3 +324,57 @@ fn limits_save_baseline_includes_limitations_and_sanitizes_temp_paths() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn limits_explains_how_to_reproduce_reported_maximum_locally() {
+    let wasm = ensure_vault_wasm();
+    let temp_dir =
+        std::env::temp_dir().join(format!("stk-limits-repro-test-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let export_path = temp_dir.join("repro.json");
+
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--export",
+        export_path.to_str().unwrap(),
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout: {stdout}");
+    assert!(
+        stdout.contains("reproduce locally:"),
+        "stdout missing reproduction guidance: {stdout}"
+    );
+    assert!(
+        stdout.contains("batch_payout"),
+        "reproduction guidance missing function name: {stdout}"
+    );
+    assert!(
+        stdout.contains("recipients"),
+        "reproduction guidance missing ramp parameter: {stdout}"
+    );
+
+    let export_content = std::fs::read_to_string(&export_path).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&export_content).unwrap();
+    assert!(
+        json["reproduction"].is_string(),
+        "JSON export missing reproduction guidance: {json}"
+    );
+    let repro_str = json["reproduction"].as_str().unwrap();
+    assert!(
+        repro_str.contains("batch_payout"),
+        "repro string: {repro_str}"
+    );
+    assert!(
+        repro_str.contains("recipients"),
+        "repro string: {repro_str}"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

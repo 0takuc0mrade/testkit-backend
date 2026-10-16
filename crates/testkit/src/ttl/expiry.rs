@@ -473,6 +473,39 @@ impl TestEnv {
         self.try_ttl_of_val(contract, kind, &key_val)
     }
 
+    /// Returns the current TTL of a storage entry in ledgers.
+    ///
+    /// Panics if the entry does not exist, or — for
+    /// [`StorageKind::Persistent`] and [`StorageKind::Temporary`] — has
+    /// already expired. This matches `soroban_sdk::testutils`' own
+    /// `get_ttl` methods, which this is built on.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::ttl::StorageKind;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Store;
+    ///
+    /// #[contractimpl]
+    /// impl Store {
+    ///     pub fn set(env: Env, key: Symbol, value: i128) {
+    ///         env.storage().persistent().set(&key, &value);
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Store, ());
+    /// StoreClient::new(env.env(), &id).set(&symbol_short!("k"), &1);
+    ///
+    /// let ttl = env.ttl_of(&id, StorageKind::Persistent, symbol_short!("k"));
+    /// assert!(ttl > 0);
+    /// # }
+    /// ```
     pub fn ttl_of<K: IntoVal<Env, Val>>(
         &self,
         contract: &Address,
@@ -1611,9 +1644,10 @@ impl TestEnv {
     }
 
     fn ttl_of_val(&self, contract: &Address, kind: StorageKind, key_val: &Val) -> u32 {
-        self.try_ttl_of_val(contract, kind, key_val).unwrap_or_else(|err| {
-            panic!("{err}");
-        })
+        self.try_ttl_of_val(contract, kind, key_val)
+            .unwrap_or_else(|err| {
+                panic!("{err}");
+            })
     }
 }
 

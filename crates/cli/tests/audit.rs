@@ -91,8 +91,16 @@ fn audit_skips_excluded_directories() {
     std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
     std::fs::create_dir_all(root.join(".git/objects")).unwrap();
     std::fs::write(root.join("src/vault.rs"), UNAUTHORIZED_ENTRY_POINT).unwrap();
-    std::fs::write(root.join("target/debug/generated.rs"), UNAUTHORIZED_ENTRY_POINT).unwrap();
-    std::fs::write(root.join("node_modules/pkg/dep.rs"), UNAUTHORIZED_ENTRY_POINT).unwrap();
+    std::fs::write(
+        root.join("target/debug/generated.rs"),
+        UNAUTHORIZED_ENTRY_POINT,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("node_modules/pkg/dep.rs"),
+        UNAUTHORIZED_ENTRY_POINT,
+    )
+    .unwrap();
     std::fs::write(root.join(".git/objects/blob.rs"), UNAUTHORIZED_ENTRY_POINT).unwrap();
 
     let output = run(&["audit", root.to_str().unwrap()]);
@@ -135,7 +143,9 @@ fn audit_scans_stdin_with_dash() {
 
 #[test]
 fn audit_reports_a_missing_path_actionably() {
-    let missing = std::env::temp_dir().join("stk-audit-path-that-does-not-exist").join("nope");
+    let missing = std::env::temp_dir()
+        .join("stk-audit-path-that-does-not-exist")
+        .join("nope");
     let output = run(&["audit", missing.to_str().unwrap()]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);

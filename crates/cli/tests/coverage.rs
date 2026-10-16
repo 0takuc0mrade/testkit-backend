@@ -107,3 +107,31 @@ fn fail_under_percentage_bounds_are_enforced() {
         "{stderr_over}"
     );
 }
+
+#[test]
+fn format_names_are_consistent_in_errors_and_help() {
+    let output = run(&["coverage", "--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("text"), "{stdout}");
+    assert!(stdout.contains("lcov"), "{stdout}");
+    assert!(stdout.contains("html"), "{stdout}");
+    assert!(stdout.contains("json"), "{stdout}");
+
+    // Format names in error messages:
+    let output_text_out = run(&["coverage", "--format", "text", "--output", "coverage.json"]);
+    assert!(!output_text_out.status.success());
+    let stderr_text = String::from_utf8_lossy(&output_text_out.stderr);
+    assert!(
+        stderr_text.contains("--output is only valid with --format json (got --format text)"),
+        "{stderr_text}"
+    );
+
+    let output_lcov_open = run(&["coverage", "--format", "lcov", "--open"]);
+    assert!(!output_lcov_open.status.success());
+    let stderr_lcov = String::from_utf8_lossy(&output_lcov_open.stderr);
+    assert!(
+        stderr_lcov.contains("--open is only valid with --format html (got --format lcov)"),
+        "{stderr_lcov}"
+    );
+}

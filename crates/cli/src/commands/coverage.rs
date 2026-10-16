@@ -1,11 +1,15 @@
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::process::Command;
 
 use clap::{Args, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 use super::CliError;
 
 /// Output format for `soroban-testkit coverage`.
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lowercase")]
 pub enum Format {
     /// Per-file coverage stats printed to the terminal.
     Text,
@@ -17,10 +21,76 @@ pub enum Format {
     Json,
 }
 
+impl Format {
+    /// All supported format names in canonical lowercase representation.
+    #[allow(dead_code)]
+    pub const ALL: &'static [&'static str] = &["text", "lcov", "html", "json"];
+
+    /// Canonical lowercase string representation of the format.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Format::Text => "text",
+            Format::Lcov => "lcov",
+            Format::Html => "html",
+            Format::Json => "json",
+        }
+    }
+}
+
+impl std::fmt::Display for Format {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Overall line coverage summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoverageSummary {
+    pub lines_covered: usize,
+    pub lines_total: usize,
+    pub line_percent: f64,
+}
+
+/// Package-level line coverage summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PackageSummary {
+    pub package_name: String,
+    pub lines_covered: usize,
+    pub lines_total: usize,
+    pub line_percent: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+}
+
+/// File-level line coverage summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileSummary {
+    pub filename: String,
+    pub lines_covered: usize,
+    pub lines_total: usize,
+    pub line_percent: f64,
+}
+
+/// Generates an actionable error message when actual coverage is below the expected --fail-under threshold.
+pub fn fail_under_error(actual: f64, expected: f64) -> CliError {
+    CliError(format!(
+        "coverage failed: actual line coverage {actual:.2}% is below the required --fail-under threshold of {expected:.2}%"
+    ))
+}
+
+/// Validates that `actual` line coverage satisfies `expected` fail-under threshold.
+pub fn validate_fail_under(actual: f64, expected: f64) -> Result<(), CliError> {
+    if actual < expected {
+        Err(fail_under_error(actual, expected))
+    } else {
+        Ok(())
+    }
+}
+
 /// Arguments for `soroban-testkit coverage`.
 #[derive(Args)]
 pub struct CoverageArgs {
-    /// Output format.
+    /// Output format (text, lcov, html, json).
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
     /// Fail (non-zero exit) if line coverage is below this percentage.
@@ -54,7 +124,7 @@ pub struct CoverageArgs {
     /// Defaults to the current directory.
     #[arg(long, value_name = "DIR")]
     output_dir: Option<std::path::PathBuf>,
-    /// Write JSON to this path (defaults to coverage.json).
+    /// Write JSON to this path (defaults to coverage.json). Only valid with --format json.
     #[arg(long, value_name = "PATH")]
     output: Option<std::path::PathBuf>,
 }
@@ -129,7 +199,11 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     })?;
 
     if !status.success() {
-        return Err(CliError(coverage_failure_message(status, args.open)));
+        return Err(CliError(coverage_failure_message(
+            status,
+            args.open,
+            args.fail_under,
+        )));
     }
 
     validate_coverage_outputs(&args)?;
@@ -182,7 +256,7 @@ pub(crate) fn validate_coverage_outputs(args: &CoverageArgs) -> Result<(), CliEr
 
             if !output_path.exists() {
                 return Err(CliError(format!(
-                    "coverage output file not found at '{}'; \
+                    "coverage LCOV output file not found at '{}'; \
                      the coverage tool may have failed to generate the output or no source files were instrumented — \
                      check the coverage run output above for errors",
                     output_path.display()
@@ -191,17 +265,23 @@ pub(crate) fn validate_coverage_outputs(args: &CoverageArgs) -> Result<(), CliEr
 
             let contents = std::fs::read_to_string(&output_path).map_err(|err| {
                 CliError(format!(
-                    "failed to read coverage output at '{}': {err}",
+                    "failed to read coverage LCOV output at '{}': {err}",
                     output_path.display()
                 ))
             })?;
 
             if contents.trim().is_empty() {
                 return Err(CliError(format!(
-                    "coverage output file at '{}' is empty; \
+                    "coverage LCOV output file at '{}' is empty; \
                      this usually indicates that no tests ran or no source files were instrumented",
                     output_path.display()
                 )));
+            }
+
+            if let Some(expected) = args.fail_under {
+                if let Some((_, _, pct)) = parse_lcov_coverage(&contents) {
+                    validate_fail_under(pct, expected)?;
+                }
             }
 
             Ok(())
@@ -239,9 +319,176 @@ pub(crate) fn validate_coverage_outputs(args: &CoverageArgs) -> Result<(), CliEr
                 )));
             }
 
+            let (augmented, summary) = augment_coverage_json(&contents)?;
+            std::fs::write(&output_path, augmented).map_err(|err| {
+                CliError(format!(
+                    "failed to write augmented coverage JSON output to '{}': {err}",
+                    output_path.display()
+                ))
+            })?;
+
+            if let Some(expected) = args.fail_under {
+                if summary.lines_total > 0 {
+                    validate_fail_under(summary.line_percent, expected)?;
+                }
+            }
+
             Ok(())
         }
     }
+}
+
+pub(crate) fn parse_lcov_coverage(contents: &str) -> Option<(usize, usize, f64)> {
+    let mut total_lf = 0usize;
+    let mut total_lh = 0usize;
+    for line in contents.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("LF:") {
+            if let Ok(v) = rest.parse::<usize>() {
+                total_lf += v;
+            }
+        } else if let Some(rest) = line.strip_prefix("LH:") {
+            if let Ok(v) = rest.parse::<usize>() {
+                total_lh += v;
+            }
+        }
+    }
+    if total_lf > 0 {
+        let pct = (total_lh as f64 / total_lf as f64) * 100.0;
+        Some((total_lh, total_lf, pct))
+    } else {
+        None
+    }
+}
+
+/// Augments raw llvm-cov JSON export with stable `package_summaries`, `file_summaries`, and `summary` fields.
+pub fn augment_coverage_json(raw_json: &str) -> Result<(String, CoverageSummary), CliError> {
+    let mut root: serde_json::Value = serde_json::from_str(raw_json)
+        .map_err(|err| CliError(format!("failed to parse coverage JSON output: {err}")))?;
+
+    let mut file_summaries = Vec::new();
+    let mut total_covered = 0usize;
+    let mut total_lines = 0usize;
+
+    if let Some(data_arr) = root.get("data").and_then(|d| d.as_array()) {
+        for entry in data_arr {
+            if let Some(files) = entry.get("files").and_then(|f| f.as_array()) {
+                for file_obj in files {
+                    let filename = file_obj
+                        .get("filename")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let lines_summary = file_obj.get("summary").and_then(|s| s.get("lines"));
+                    let lines_total = lines_summary
+                        .and_then(|l| l.get("count"))
+                        .and_then(|c| c.as_u64())
+                        .unwrap_or(0) as usize;
+                    let lines_covered = lines_summary
+                        .and_then(|l| l.get("covered"))
+                        .and_then(|c| c.as_u64())
+                        .unwrap_or(0) as usize;
+                    let line_percent = if lines_total > 0 {
+                        lines_summary
+                            .and_then(|l| l.get("percent"))
+                            .and_then(|p| p.as_f64())
+                            .unwrap_or_else(|| (lines_covered as f64 / lines_total as f64) * 100.0)
+                    } else {
+                        100.0
+                    };
+
+                    total_covered += lines_covered;
+                    total_lines += lines_total;
+
+                    file_summaries.push(FileSummary {
+                        filename,
+                        lines_covered,
+                        lines_total,
+                        line_percent,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut packages_map: BTreeMap<String, (usize, usize, Vec<String>)> = BTreeMap::new();
+    for file in &file_summaries {
+        let pkg_name = infer_package_name(&file.filename);
+        let entry = packages_map
+            .entry(pkg_name)
+            .or_insert_with(|| (0, 0, Vec::new()));
+        entry.0 += file.lines_covered;
+        entry.1 += file.lines_total;
+        entry.2.push(file.filename.clone());
+    }
+
+    let package_summaries: Vec<PackageSummary> = packages_map
+        .into_iter()
+        .map(|(pkg, (cov, tot, files))| {
+            let pct = if tot > 0 {
+                (cov as f64 / tot as f64) * 100.0
+            } else {
+                100.0
+            };
+            PackageSummary {
+                package_name: pkg,
+                lines_covered: cov,
+                lines_total: tot,
+                line_percent: pct,
+                files,
+            }
+        })
+        .collect();
+
+    let line_percent = if total_lines > 0 {
+        (total_covered as f64 / total_lines as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let summary = CoverageSummary {
+        lines_covered: total_covered,
+        lines_total: total_lines,
+        line_percent,
+    };
+
+    if let Some(obj) = root.as_object_mut() {
+        obj.insert(
+            "package_summaries".to_string(),
+            serde_json::to_value(&package_summaries)
+                .map_err(|err| CliError(format!("failed to serialize package summaries: {err}")))?,
+        );
+        obj.insert(
+            "file_summaries".to_string(),
+            serde_json::to_value(&file_summaries)
+                .map_err(|err| CliError(format!("failed to serialize file summaries: {err}")))?,
+        );
+        obj.insert(
+            "summary".to_string(),
+            serde_json::to_value(&summary)
+                .map_err(|err| CliError(format!("failed to serialize coverage summary: {err}")))?,
+        );
+    }
+
+    let augmented_str = serde_json::to_string_pretty(&root)
+        .map_err(|err| CliError(format!("failed to format augmented coverage JSON: {err}")))?;
+
+    Ok((augmented_str, summary))
+}
+
+fn infer_package_name(path_str: &str) -> String {
+    let path = Path::new(path_str);
+    let mut components = path.components().peekable();
+    while let Some(comp) = components.next() {
+        let name = comp.as_os_str().to_string_lossy();
+        if (name == "crates" || name == "examples") && components.peek().is_some() {
+            if let Some(pkg) = components.next() {
+                return pkg.as_os_str().to_string_lossy().to_string();
+            }
+        }
+    }
+    "workspace".to_string()
 }
 
 fn validate_html_output(output_dir: Option<&std::path::Path>) -> Result<(), CliError> {
@@ -260,7 +507,11 @@ fn validate_html_output(output_dir: Option<&std::path::Path>) -> Result<(), CliE
     Ok(())
 }
 
-fn coverage_failure_message(status: std::process::ExitStatus, open_requested: bool) -> String {
+fn coverage_failure_message(
+    status: std::process::ExitStatus,
+    open_requested: bool,
+    fail_under: Option<f64>,
+) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -268,6 +519,13 @@ fn coverage_failure_message(status: std::process::ExitStatus, open_requested: bo
         if let Some(signal) = status.signal() {
             return format!("coverage run terminated by signal {signal}");
         }
+    }
+
+    if let Some(expected) = fail_under {
+        return format!(
+            "coverage run failed (cargo llvm-cov exited with {status}); \
+             line coverage failed to meet the required --fail-under threshold of {expected:.2}%"
+        );
     }
 
     if open_requested {
@@ -299,14 +557,16 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
         ));
     }
     if args.output.is_some() && !matches!(args.format, Format::Json) {
-        return Err(CliError(
-            "--output is only valid with --format json".to_string(),
-        ));
+        return Err(CliError(format!(
+            "--output is only valid with --format json (got --format {})",
+            args.format
+        )));
     }
     if args.open && !matches!(args.format, Format::Html | Format::Text) {
-        return Err(CliError(
-            "--open is only valid with --format html".to_string(),
-        ));
+        return Err(CliError(format!(
+            "--open is only valid with --format html (got --format {})",
+            args.format
+        )));
     }
 
     let mut cmd = Command::new("cargo");
@@ -494,7 +754,7 @@ mod tests {
     fn signal_termination_is_reported_distinctly() {
         use std::os::unix::process::ExitStatusExt;
 
-        let message = coverage_failure_message(std::process::ExitStatus::from_raw(9), false);
+        let message = coverage_failure_message(std::process::ExitStatus::from_raw(9), false, None);
         assert_eq!(message, "coverage run terminated by signal 9");
     }
 
@@ -770,14 +1030,160 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
 
         let status = std::process::ExitStatus::from_raw(256); // exit code 1
-        let msg_normal = coverage_failure_message(status, false);
+        let msg_normal = coverage_failure_message(status, false, None);
         assert!(
             msg_normal.contains("if no source files were instrumented"),
             "{msg_normal}"
         );
 
-        let msg_open = coverage_failure_message(status, true);
+        let msg_open = coverage_failure_message(status, true, None);
         assert!(msg_open.contains("desktop browser opener"), "{msg_open}");
         assert!(msg_open.contains("headless/CI"), "{msg_open}");
+
+        let msg_fail_under = coverage_failure_message(status, false, Some(85.5));
+        assert!(
+            msg_fail_under.contains("--fail-under threshold of 85.50%"),
+            "{msg_fail_under}"
+        );
+    }
+
+    #[test]
+    fn format_enum_has_stable_names_and_display() {
+        assert_eq!(Format::ALL, &["text", "lcov", "html", "json"]);
+        assert_eq!(Format::Text.as_str(), "text");
+        assert_eq!(Format::Lcov.as_str(), "lcov");
+        assert_eq!(Format::Html.as_str(), "html");
+        assert_eq!(Format::Json.as_str(), "json");
+
+        assert_eq!(format!("{}", Format::Text), "text");
+        assert_eq!(format!("{}", Format::Lcov), "lcov");
+        assert_eq!(format!("{}", Format::Html), "html");
+        assert_eq!(format!("{}", Format::Json), "json");
+    }
+
+    #[test]
+    fn fail_under_error_includes_actual_and_expected_values() {
+        let err = fail_under_error(78.543, 90.0);
+        assert!(err.0.contains("actual line coverage 78.54%"), "{}", err.0);
+        assert!(
+            err.0.contains("--fail-under threshold of 90.00%"),
+            "{}",
+            err.0
+        );
+
+        assert!(validate_fail_under(90.0, 90.0).is_ok());
+        assert!(validate_fail_under(95.5, 90.0).is_ok());
+        let val_err = validate_fail_under(89.99, 90.0).unwrap_err();
+        assert!(val_err.0.contains("89.99%"), "{}", val_err.0);
+        assert!(val_err.0.contains("90.00%"), "{}", val_err.0);
+    }
+
+    #[test]
+    fn augment_coverage_json_adds_stable_package_and_file_summaries() {
+        let raw_json = r#"{
+            "data": [
+                {
+                    "files": [
+                        {
+                            "filename": "crates/testkit/src/lib.rs",
+                            "summary": {
+                                "lines": {
+                                    "count": 100,
+                                    "covered": 85,
+                                    "percent": 85.0
+                                }
+                            }
+                        },
+                        {
+                            "filename": "crates/testkit/src/money.rs",
+                            "summary": {
+                                "lines": {
+                                    "count": 50,
+                                    "covered": 45,
+                                    "percent": 90.0
+                                }
+                            }
+                        },
+                        {
+                            "filename": "crates/cli/src/main.rs",
+                            "summary": {
+                                "lines": {
+                                    "count": 200,
+                                    "covered": 150,
+                                    "percent": 75.0
+                                }
+                            }
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let (augmented, summary) = augment_coverage_json(raw_json).unwrap();
+        assert_eq!(summary.lines_total, 350);
+        assert_eq!(summary.lines_covered, 280);
+        assert!((summary.line_percent - 80.0).abs() < 1e-4);
+
+        let parsed: serde_json::Value = serde_json::from_str(&augmented).unwrap();
+        assert!(parsed["package_summaries"].is_array());
+        assert!(parsed["file_summaries"].is_array());
+        assert!(parsed["summary"].is_object());
+
+        let pkgs = parsed["package_summaries"].as_array().unwrap();
+        assert_eq!(pkgs.len(), 2); // testkit and cli
+
+        let files = parsed["file_summaries"].as_array().unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0]["filename"], "crates/testkit/src/lib.rs");
+        assert_eq!(files[0]["lines_covered"], 85);
+        assert_eq!(files[0]["lines_total"], 100);
+        assert_eq!(files[0]["line_percent"], 85.0);
+    }
+
+    #[test]
+    fn validate_coverage_outputs_checks_fail_under_on_json() {
+        let dir =
+            std::env::temp_dir().join(format!("stk-cov-fail-under-json-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json_path = dir.join("coverage.json");
+
+        let raw_json = r#"{
+            "data": [
+                {
+                    "files": [
+                        {
+                            "filename": "crates/testkit/src/lib.rs",
+                            "summary": {
+                                "lines": {
+                                    "count": 100,
+                                    "covered": 80,
+                                    "percent": 80.0
+                                }
+                            }
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        std::fs::write(&json_path, raw_json).unwrap();
+
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output = Some(json_path.clone());
+        a.fail_under = Some(90.0);
+
+        let err = validate_coverage_outputs(&a).unwrap_err();
+        assert!(err.0.contains("actual line coverage 80.00%"), "{}", err.0);
+        assert!(
+            err.0.contains("--fail-under threshold of 90.00%"),
+            "{}",
+            err.0
+        );
+
+        // Satisfied
+        a.fail_under = Some(75.0);
+        assert!(validate_coverage_outputs(&a).is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

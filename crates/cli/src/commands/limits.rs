@@ -35,7 +35,9 @@ pub const SEARCH_UPPER_BOUND: u32 = 1 << 24;
 /// Every failure category is reported verbatim in the human-readable summary,
 /// the refinement audit, and the JSON export, so a failure can be triaged the
 /// same way regardless of which output format a CI job happens to consume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProbeFailureCategory {
     /// The child process ran to completion and exited non-zero: the contract
@@ -149,6 +151,9 @@ pub struct LimitsSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit: Option<RefinementAudit>,
     pub measurement_limitations: String,
+    /// Actionable instructions for reproducing the reported maximum locally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reproduction: Option<String>,
 }
 
 impl LimitsSummary {
@@ -189,6 +194,9 @@ impl LimitsSummary {
             ));
         }
         out.push_str(&format!("  ({})\n", self.measurement_limitations));
+        if let Some(repro) = &self.reproduction {
+            out.push_str(&format!("  reproduce locally: {repro}\n"));
+        }
         if self.hit_upper_bound {
             out.push_str(&format!(
                 "  note: search stopped at the built-in upper bound ({SEARCH_UPPER_BOUND}); the \
@@ -502,6 +510,14 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     // time (a known-successful call is safe to make directly).
     let (instructions, memory_bytes) = measure(&args, best)?;
 
+    let reproduction = Some(build_reproduction_guidance(
+        &sanitize_report_path(&args.contract),
+        &args.function,
+        &args.ramp,
+        best,
+        &args.arg_values,
+    ));
+
     let summary = LimitsSummary {
         contract: sanitize_report_path(&args.contract),
         function: args.function.clone(),
@@ -516,6 +532,7 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         probe_timeout_secs: args.probe_timeout,
         audit: refinement_audit,
         measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
+        reproduction,
     };
     print!("{}", summary.render_text());
 
@@ -548,6 +565,24 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// Builds actionable guidance explaining how to reproduce the discovered ceiling locally.
+pub fn build_reproduction_guidance(
+    contract: &str,
+    function: &str,
+    ramp: &str,
+    best: u32,
+    arg_values: &[String],
+) -> String {
+    let mut cmd =
+        format!("soroban-testkit limits --contract {contract} --fn {function} --ramp {ramp}");
+    for arg in arg_values {
+        cmd.push_str(&format!(" --arg {arg}"));
+    }
+    format!(
+        "invoke `{function}` with `{ramp}` = {best} in a test environment; to re-verify the boundary via CLI run: `{cmd}`"
+    )
 }
 
 fn validate_percentage(name: &str, pct: f64) -> Result<(), CliError> {
@@ -1493,6 +1528,9 @@ mod tests {
             probe_timeout_secs: 30,
             audit: None,
             measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
+            reproduction: Some(
+                "invoke `batch_payout` with `recipients` = 100 in a test environment; to re-verify the boundary via CLI run: `soroban-testkit limits --contract vault.wasm --fn batch_payout --ramp recipients`".to_string(),
+            ),
         }
     }
 
@@ -2185,10 +2223,20 @@ mod tests {
 
         let text = summary.render_text();
         assert!(text.contains("last successful recipients"), "{text}");
-        assert!(text.contains("first failed recipients value: 16 [timed-out]"), "{text}");
-        assert!(text.contains("probe failures: exit-failure: 2, timed-out: 1"), "{text}");
-        assert!(text.contains("boundary refinement: probed 1 values"), "{text}");
+        assert!(
+            text.contains("first failed recipients value: 16 [timed-out]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("probe failures: exit-failure: 2, timed-out: 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("boundary refinement: probed 1 values"),
+            "{text}"
+        );
         assert!(text.contains("--probe-timeout (30s)"), "{text}");
+        assert!(text.contains("reproduce locally:"), "{text}");
 
         // The same summary serializes the same boundary into JSON, so the
         // two formats cannot drift apart.
@@ -2196,6 +2244,26 @@ mod tests {
         assert_eq!(json["best"], 15);
         assert_eq!(json["first_failure_category"], "timed-out");
         assert_eq!(json["probe_failure_counts"]["exit-failure"], 2);
+        assert!(json["reproduction"]
+            .as_str()
+            .unwrap()
+            .contains("batch_payout"));
+    }
+
+    #[test]
+    fn build_reproduction_guidance_includes_args_and_clarity() {
+        let guidance = build_reproduction_guidance(
+            "vault.wasm",
+            "batch_payout",
+            "recipients",
+            42,
+            &["token=0x1234".to_string(), "mode=1".to_string()],
+        );
+        assert!(guidance.contains("invoke `batch_payout` with `recipients` = 42"));
+        assert!(guidance.contains("--contract vault.wasm"));
+        assert!(guidance.contains("--fn batch_payout"));
+        assert!(guidance.contains("--ramp recipients"));
+        assert!(guidance.contains("--arg token=0x1234 --arg mode=1"));
     }
 
     #[test]
