@@ -1,4 +1,5 @@
 use std::panic;
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -9,6 +10,30 @@ use soroban_sdk::xdr::{ScSpecEntry, ScSpecFunctionInputV0, ScSpecFunctionV0, ScS
 use soroban_sdk::{Address, Env, IntoVal, Symbol, TryFromVal, Val, Vec as SVec};
 
 use super::CliError;
+
+/// Measurement limitations warning reported across stdout and machine-readable outputs.
+pub const MEASUREMENT_LIMITATIONS: &str =
+    "ledger reads/writes and transaction size are not measured by this command; see --help";
+
+/// A single step in a numeric boundary refinement search.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RefinementStep {
+    pub step: usize,
+    pub probe_value: u32,
+    pub succeeded: bool,
+    pub window_low: u32,
+    pub window_high: u32,
+}
+
+/// Structured audit trail documenting boundary refinement progress and final window.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RefinementAudit {
+    pub initial_low: u32,
+    pub initial_high: u32,
+    pub steps: Vec<RefinementStep>,
+    pub final_success: u32,
+    pub final_failure: u32,
+}
 
 /// Arguments for `soroban-testkit limits`.
 #[derive(Args)]
@@ -203,10 +228,13 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     // Binary search between the last success and the first failure for a
     // tighter bound, if we found one.
     let mut best = last_ok;
+    let mut refinement_audit = None;
     if let Some(hi_start) = high {
-        let (last_success, first_failure) = refine_upper_bound(last_ok, hi_start, &mut probe)?;
+        let (last_success, first_failure, audit) =
+            refine_upper_bound_audited(last_ok, hi_start, &mut probe)?;
         best = last_success;
         last_failed_probe = Some(first_failure);
+        refinement_audit = Some(audit);
     }
 
     // Measure resources at the best-known-good value, in-process this
@@ -222,10 +250,17 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     if let Some(failed) = last_failed_probe {
         println!("  first failed {} value: {failed}", args.ramp);
     }
-    println!(
-        "  (ledger reads/writes and transaction size are not measured by this command; \
-         see --help)"
-    );
+    if let Some(audit) = &refinement_audit {
+        println!(
+            "  boundary refinement: probed {} values between {} and {} (final boundary: [{}, {}])",
+            audit.steps.len(),
+            audit.initial_low,
+            audit.initial_high,
+            audit.final_success,
+            audit.final_failure,
+        );
+    }
+    println!("  ({MEASUREMENT_LIMITATIONS})");
     if hit_upper_bound {
         println!(
             "  note: search stopped at the built-in upper bound ({}); the contract may support \
@@ -256,6 +291,7 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     if let Some(save_path) = &args.save_baseline {
         write_baseline(
             save_path,
+            &args.contract,
             &args.ramp,
             &args.function,
             best,
@@ -267,11 +303,13 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     if let Some(export_path) = &args.export {
         export_results(
             export_path,
+            &args.contract,
             &args.ramp,
             &args.function,
             best,
             instructions,
             memory_bytes,
+            refinement_audit.as_ref(),
         )?;
         println!("exported results to {}", export_path.display());
     }
@@ -288,19 +326,63 @@ fn validate_percentage(name: &str, pct: f64) -> Result<(), CliError> {
     Ok(())
 }
 
-fn refine_upper_bound<F>(mut low: u32, mut high: u32, probe: &mut F) -> Result<(u32, u32), CliError>
+/// Refines the boundary between a known success (`low`) and a known failure (`high`)
+/// using binary search, recording every intermediate step in a [`RefinementAudit`].
+pub fn refine_upper_bound_audited<F>(
+    mut low: u32,
+    mut high: u32,
+    probe: &mut F,
+) -> Result<(u32, u32, RefinementAudit), CliError>
 where
     F: FnMut(u32) -> Result<bool, CliError>,
 {
+    if low >= high {
+        return Err(CliError(format!(
+            "refine_upper_bound requires lower bound ({low}) < upper bound ({high})"
+        )));
+    }
+
+    let initial_low = low;
+    let initial_high = high;
+    let mut steps = Vec::new();
+    let mut step_num = 1;
+
     while low.saturating_add(1) < high {
         let middle = low + (high - low) / 2;
-        if probe(middle)? {
+        let succeeded = probe(middle)?;
+        if succeeded {
             low = middle;
         } else {
             high = middle;
         }
+        steps.push(RefinementStep {
+            step: step_num,
+            probe_value: middle,
+            succeeded,
+            window_low: low,
+            window_high: high,
+        });
+        step_num += 1;
     }
-    Ok((low, high))
+
+    let audit = RefinementAudit {
+        initial_low,
+        initial_high,
+        steps,
+        final_success: low,
+        final_failure: high,
+    };
+
+    Ok((low, high, audit))
+}
+
+#[allow(dead_code)]
+pub fn refine_upper_bound<F>(low: u32, high: u32, probe: &mut F) -> Result<(u32, u32), CliError>
+where
+    F: FnMut(u32) -> Result<bool, CliError>,
+{
+    let (success, failure, _) = refine_upper_bound_audited(low, high, probe)?;
+    Ok((success, failure))
 }
 
 /// The hidden probe entry point: performs exactly one invocation and
@@ -348,33 +430,80 @@ fn wait_with_timeout(
     }
 }
 
+/// Sanitizes a filesystem path for machine-readable reports, ensuring host-specific
+/// or process-specific temporary directory prefixes do not leak into reproducible outputs.
+pub fn sanitize_report_path(path: &Path) -> String {
+    let temp_dir = std::env::temp_dir();
+    let is_temp = path.starts_with(&temp_dir)
+        || temp_dir
+            .canonicalize()
+            .map(|t| path.starts_with(t))
+            .unwrap_or(false)
+        || path.to_string_lossy().starts_with("/tmp")
+        || path.to_string_lossy().starts_with("/var/tmp");
+
+    if is_temp {
+        return path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "contract.wasm".to_string());
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Ok(rel) = path.strip_prefix(&cwd) {
+            return rel.to_string_lossy().to_string();
+        }
+        if let Ok(canonical_cwd) = cwd.canonicalize() {
+            if let Ok(rel) = path.strip_prefix(&canonical_cwd) {
+                return rel.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    path.to_string_lossy().to_string()
+}
+
 /// A previously-saved `limits` result, for `--baseline` regression checks.
-/// Deliberately not JSON (no `serde` dependency anywhere in this
-/// workspace) — a flat `key=value` file is sufficient for one flat record
-/// and keeps this feature within its own module boundary.
-#[derive(Debug)]
-struct Baseline {
-    function: String,
-    ramp: String,
-    best: u32,
-    instructions: u64,
-    memory_bytes: u64,
+/// Stored as a flat `key=value` file recording ceiling and resource metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Baseline {
+    pub contract: Option<String>,
+    pub function: String,
+    pub ramp: String,
+    pub best: u32,
+    pub instructions: u64,
+    pub memory_bytes: u64,
+    pub measurement_limitations: Option<String>,
 }
 
 impl Baseline {
-    fn to_file_contents(&self) -> String {
-        format!(
-            "function={}\nramp={}\nbest={}\ninstructions={}\nmemory_bytes={}\n",
-            self.function, self.ramp, self.best, self.instructions, self.memory_bytes
-        )
+    pub fn to_file_contents(&self) -> String {
+        let mut out = String::new();
+        if let Some(c) = &self.contract {
+            out.push_str(&format!("contract={c}\n"));
+        }
+        out.push_str(&format!(
+            "function={}\nramp={}\nbest={}\ninstructions={}\nmemory_bytes={}\nmeasurement_limitations={}\n",
+            self.function,
+            self.ramp,
+            self.best,
+            self.instructions,
+            self.memory_bytes,
+            self.measurement_limitations
+                .as_deref()
+                .unwrap_or(MEASUREMENT_LIMITATIONS),
+        ));
+        out
     }
 
-    fn parse(contents: &str) -> Result<Self, CliError> {
+    pub fn parse(contents: &str) -> Result<Self, CliError> {
+        let mut contract = None;
         let mut function = None;
         let mut ramp = None;
         let mut best = None;
         let mut instructions = None;
         let mut memory_bytes = None;
+        let mut measurement_limitations = None;
 
         for (line_no, line) in contents.lines().enumerate() {
             let line = line.trim();
@@ -388,6 +517,7 @@ impl Baseline {
                 )));
             };
             match key {
+                "contract" => contract = Some(value.to_string()),
                 "function" => function = Some(value.to_string()),
                 "ramp" => ramp = Some(value.to_string()),
                 "best" => {
@@ -409,6 +539,7 @@ impl Baseline {
                         ))
                     })?)
                 }
+                "measurement_limitations" => measurement_limitations = Some(value.to_string()),
                 other => {
                     return Err(CliError(format!(
                         "malformed baseline file at line {}: unknown key {other:?}",
@@ -419,6 +550,7 @@ impl Baseline {
         }
 
         Ok(Baseline {
+            contract,
             function: function
                 .ok_or_else(|| CliError("baseline file is missing `function`".to_string()))?,
             ramp: ramp.ok_or_else(|| CliError("baseline file is missing `ramp`".to_string()))?,
@@ -427,24 +559,30 @@ impl Baseline {
                 .ok_or_else(|| CliError("baseline file is missing `instructions`".to_string()))?,
             memory_bytes: memory_bytes
                 .ok_or_else(|| CliError("baseline file is missing `memory_bytes`".to_string()))?,
+            measurement_limitations: measurement_limitations
+                .or_else(|| Some(MEASUREMENT_LIMITATIONS.to_string())),
         })
     }
 }
 
-fn write_baseline(
-    path: &std::path::Path,
+pub fn write_baseline(
+    path: &Path,
+    contract: &Path,
     ramp: &str,
     function: &str,
     best: u32,
     instructions: u64,
     memory_bytes: u64,
 ) -> Result<(), CliError> {
+    let sanitized_contract = sanitize_report_path(contract);
     let baseline = Baseline {
+        contract: Some(sanitized_contract),
         function: function.to_string(),
         ramp: ramp.to_string(),
         best,
         instructions,
         memory_bytes,
+        measurement_limitations: Some(MEASUREMENT_LIMITATIONS.to_string()),
     };
     std::fs::write(path, baseline.to_file_contents()).map_err(|err| {
         CliError(format!(
@@ -550,27 +688,58 @@ fn compare_to_baseline(
     )))
 }
 
-fn export_results(
-    path: &std::path::Path,
+#[allow(clippy::too_many_arguments)]
+pub fn export_results(
+    path: &Path,
+    contract: &Path,
     ramp: &str,
     function: &str,
     best: u32,
     instructions: u64,
     memory_bytes: u64,
+    audit: Option<&RefinementAudit>,
 ) -> Result<(), CliError> {
-    let baseline = Baseline {
-        function: function.to_string(),
-        ramp: ramp.to_string(),
-        best,
-        instructions,
-        memory_bytes,
-    };
-    std::fs::write(path, baseline.to_file_contents()).map_err(|err| {
-        CliError(format!(
-            "failed to export results to {}: {err}",
-            path.display()
-        ))
-    })
+    let sanitized_contract = sanitize_report_path(contract);
+
+    if path.extension().is_some_and(|ext| ext == "json") {
+        let mut report = serde_json::json!({
+            "contract": sanitized_contract,
+            "function": function,
+            "ramp": ramp,
+            "best": best,
+            "instructions": instructions,
+            "memory_bytes": memory_bytes,
+            "measurement_limitations": MEASUREMENT_LIMITATIONS,
+        });
+        if let Some(audit) = audit {
+            report["audit"] = serde_json::to_value(audit)
+                .map_err(|err| CliError(format!("failed to serialize audit to JSON: {err}")))?;
+        }
+        let json_str = serde_json::to_string_pretty(&report)
+            .map_err(|err| CliError(format!("failed to format JSON export: {err}")))?;
+        std::fs::write(path, json_str).map_err(|err| {
+            CliError(format!(
+                "failed to export results to {}: {err}",
+                path.display()
+            ))
+        })
+    } else {
+        let baseline = Baseline {
+            contract: Some(sanitized_contract),
+            function: function.to_string(),
+            ramp: ramp.to_string(),
+            best,
+            instructions,
+            memory_bytes,
+            measurement_limitations: Some(MEASUREMENT_LIMITATIONS.to_string()),
+        };
+        std::fs::write(path, baseline.to_file_contents()).map_err(|err| {
+            CliError(format!(
+                "failed to export results to {}: {err}",
+                path.display()
+            ))
+        })
+    }
 }
 
 fn measure(args: &LimitsArgs, value: u32) -> Result<(u64, u64), CliError> {
@@ -1053,11 +1222,13 @@ mod tests {
 
     fn sample_baseline() -> Baseline {
         Baseline {
+            contract: Some("vault.wasm".to_string()),
             function: "batch_payout".to_string(),
             ramp: "recipients".to_string(),
             best: 100,
             instructions: 1_000_000,
             memory_bytes: 50_000,
+            measurement_limitations: Some(MEASUREMENT_LIMITATIONS.to_string()),
         }
     }
 
@@ -1065,11 +1236,16 @@ mod tests {
     fn baseline_round_trips_through_its_file_format() {
         let baseline = sample_baseline();
         let parsed = Baseline::parse(&baseline.to_file_contents()).unwrap();
+        assert_eq!(parsed.contract, baseline.contract);
         assert_eq!(parsed.function, baseline.function);
         assert_eq!(parsed.ramp, baseline.ramp);
         assert_eq!(parsed.best, baseline.best);
         assert_eq!(parsed.instructions, baseline.instructions);
         assert_eq!(parsed.memory_bytes, baseline.memory_bytes);
+        assert_eq!(
+            parsed.measurement_limitations,
+            baseline.measurement_limitations
+        );
     }
 
     #[test]
@@ -1241,14 +1417,28 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("export.results");
 
-        export_results(&path, "recipients", "batch_payout", 100, 1_000_000, 50_000).unwrap();
+        export_results(
+            &path,
+            Path::new("vault.wasm"),
+            "recipients",
+            "batch_payout",
+            100,
+            1_000_000,
+            50_000,
+            None,
+        )
+        .unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("contract=vault.wasm"));
         assert!(contents.contains("function=batch_payout"));
         assert!(contents.contains("ramp=recipients"));
         assert!(contents.contains("best=100"));
         assert!(contents.contains("instructions=1000000"));
         assert!(contents.contains("memory_bytes=50000"));
+        assert!(contents.contains(&format!(
+            "measurement_limitations={MEASUREMENT_LIMITATIONS}"
+        )));
     }
 
     #[test]
@@ -1257,9 +1447,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("export.results");
 
-        export_results(&path, "recipients", "batch_payout", 100, 1_000_000, 50_000).unwrap();
+        export_results(
+            &path,
+            Path::new("vault.wasm"),
+            "recipients",
+            "batch_payout",
+            100,
+            1_000_000,
+            50_000,
+            None,
+        )
+        .unwrap();
 
         let baseline = Baseline::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(baseline.contract, Some("vault.wasm".to_string()));
         assert_eq!(baseline.function, "batch_payout");
         assert_eq!(baseline.ramp, "recipients");
         assert_eq!(baseline.best, 100);
@@ -1275,9 +1476,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("my baseline.txt");
 
-        write_baseline(&path, "recipients", "batch_payout", 100, 1_000_000, 50_000).unwrap();
+        write_baseline(
+            &path,
+            Path::new("vault.wasm"),
+            "recipients",
+            "batch_payout",
+            100,
+            1_000_000,
+            50_000,
+        )
+        .unwrap();
 
         let baseline = Baseline::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(baseline.contract, Some("vault.wasm".to_string()));
         assert_eq!(baseline.function, "batch_payout");
         assert_eq!(baseline.ramp, "recipients");
         assert_eq!(baseline.best, 100);
@@ -1289,9 +1500,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("my export results.txt");
 
-        export_results(&path, "recipients", "batch_payout", 100, 1_000_000, 50_000).unwrap();
+        export_results(
+            &path,
+            Path::new("vault.wasm"),
+            "recipients",
+            "batch_payout",
+            100,
+            1_000_000,
+            50_000,
+            None,
+        )
+        .unwrap();
 
         let baseline = Baseline::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(baseline.contract, Some("vault.wasm".to_string()));
         assert_eq!(baseline.function, "batch_payout");
         assert_eq!(baseline.ramp, "recipients");
         assert_eq!(baseline.best, 100);
@@ -1384,6 +1606,297 @@ mod tests {
             err_msg.contains("failed to read"),
             "expected file error, got: {}",
             err_msg
+        );
+    }
+
+    // ---- #493: numeric ramp boundary refinement audit ----
+
+    #[test]
+    fn refine_upper_bound_audited_records_all_steps_and_boundaries() {
+        let mut probed = Vec::new();
+        let (success, failure, audit) = refine_upper_bound_audited(10, 30, &mut |value| {
+            probed.push(value);
+            Ok(value <= 23)
+        })
+        .unwrap();
+
+        assert_eq!((success, failure), (23, 24));
+        assert_eq!(audit.initial_low, 10);
+        assert_eq!(audit.initial_high, 30);
+        assert_eq!(audit.final_success, 23);
+        assert_eq!(audit.final_failure, 24);
+        assert_eq!(audit.steps.len(), probed.len());
+
+        for (i, step) in audit.steps.iter().enumerate() {
+            assert_eq!(step.step, i + 1);
+            assert_eq!(step.probe_value, probed[i]);
+            assert_eq!(step.succeeded, probed[i] <= 23);
+        }
+    }
+
+    #[test]
+    fn refine_upper_bound_rejects_inverted_or_equal_bounds() {
+        let err_inverted = refine_upper_bound(30, 20, &mut |_| Ok(true)).unwrap_err();
+        assert!(
+            err_inverted
+                .0
+                .contains("requires lower bound (30) < upper bound (20)"),
+            "{}",
+            err_inverted.0
+        );
+
+        let err_equal = refine_upper_bound(20, 20, &mut |_| Ok(true)).unwrap_err();
+        assert!(
+            err_equal
+                .0
+                .contains("requires lower bound (20) < upper bound (20)"),
+            "{}",
+            err_equal.0
+        );
+    }
+
+    // ---- #494: sanitize temporary paths from machine-readable reports ----
+
+    #[test]
+    fn sanitize_report_path_strips_temp_directory_prefixes() {
+        let temp = std::env::temp_dir().join("some_run_1234/contract.wasm");
+        let sanitized = sanitize_report_path(&temp);
+        assert_eq!(sanitized, "contract.wasm");
+
+        let tmp_path = Path::new("/tmp/some_dir/mock.wasm");
+        assert_eq!(sanitize_report_path(tmp_path), "mock.wasm");
+
+        let rel_path = Path::new("relative/path/contract.wasm");
+        assert_eq!(
+            sanitize_report_path(rel_path),
+            "relative/path/contract.wasm"
+        );
+    }
+
+    #[test]
+    fn write_baseline_sanitizes_temporary_contract_path() {
+        let dir = std::env::temp_dir().join(format!("stk-sanitize-base-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clean.baseline");
+        let temp_contract = dir.join("ephemeral/vault.wasm");
+
+        write_baseline(
+            &path,
+            &temp_contract,
+            "recipients",
+            "batch_payout",
+            100,
+            1_000_000,
+            50_000,
+        )
+        .unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("contract=vault.wasm"),
+            "contents: {contents}"
+        );
+        assert!(
+            !contents.contains("stk-sanitize-base"),
+            "leaked temp dir: {contents}"
+        );
+    }
+
+    #[test]
+    fn export_results_json_sanitizes_temporary_contract_path() {
+        let dir = std::env::temp_dir().join(format!("stk-sanitize-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.json");
+        let temp_contract = dir.join("run-pid-999/vault.wasm");
+
+        export_results(
+            &path,
+            &temp_contract,
+            "recipients",
+            "batch_payout",
+            100,
+            1_000_000,
+            50_000,
+            None,
+        )
+        .unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(parsed["contract"], "vault.wasm");
+        assert!(!contents.contains("run-pid-999"));
+    }
+
+    // ---- #495: regression coverage for each supported ramp type ----
+
+    #[test]
+    fn ramp_val_supports_all_scalar_numeric_types() {
+        let env = Env::default();
+
+        // U32
+        let val = ramp_val(&env, &ScSpecTypeDef::U32, 42).unwrap();
+        let num: u32 = val.into_val(&env);
+        assert_eq!(num, 42);
+
+        // I32
+        let val = ramp_val(&env, &ScSpecTypeDef::I32, 42).unwrap();
+        let num: i32 = val.into_val(&env);
+        assert_eq!(num, 42);
+
+        // U64
+        let val = ramp_val(&env, &ScSpecTypeDef::U64, 42).unwrap();
+        let num: u64 = val.into_val(&env);
+        assert_eq!(num, 42);
+
+        // I64
+        let val = ramp_val(&env, &ScSpecTypeDef::I64, 42).unwrap();
+        let num: i64 = val.into_val(&env);
+        assert_eq!(num, 42);
+
+        // U128
+        let val = ramp_val(&env, &ScSpecTypeDef::U128, 42).unwrap();
+        let num: u128 = val.into_val(&env);
+        assert_eq!(num, 42);
+
+        // I128
+        let val = ramp_val(&env, &ScSpecTypeDef::I128, 42).unwrap();
+        let num: i128 = val.into_val(&env);
+        assert_eq!(num, 42);
+    }
+
+    #[test]
+    fn ramp_val_supports_all_vec_element_types() {
+        let env = Env::default();
+
+        let element_types = [
+            ScSpecTypeDef::Address,
+            ScSpecTypeDef::Bool,
+            ScSpecTypeDef::U32,
+            ScSpecTypeDef::I32,
+            ScSpecTypeDef::U64,
+            ScSpecTypeDef::I64,
+            ScSpecTypeDef::U128,
+            ScSpecTypeDef::I128,
+            ScSpecTypeDef::Symbol,
+            ScSpecTypeDef::String,
+            ScSpecTypeDef::Bytes,
+        ];
+
+        for element_type in element_types {
+            let type_ = ScSpecTypeDef::Vec(Box::new(ScSpecTypeVec {
+                element_type: Box::new(element_type),
+            }));
+
+            // Test 0 count
+            let val_zero = ramp_val(&env, &type_, 0).unwrap();
+            let vec_zero: SVec<Val> = val_zero.into_val(&env);
+            assert_eq!(vec_zero.len(), 0);
+
+            // Test non-zero count
+            let val = ramp_val(&env, &type_, 3).unwrap();
+            let vec: SVec<Val> = val.into_val(&env);
+            assert_eq!(vec.len(), 3);
+        }
+    }
+
+    #[test]
+    fn ramp_val_rejects_unsupported_scalar_and_composite_types() {
+        let env = Env::default();
+
+        let unsupported = [
+            ScSpecTypeDef::Void,
+            ScSpecTypeDef::Timepoint,
+            ScSpecTypeDef::Duration,
+        ];
+        for ty in unsupported {
+            let err = ramp_val(&env, &ty, 5).unwrap_err();
+            assert!(err.0.contains("isn't supported yet"), "{}", err.0);
+        }
+
+        // Unsupported Vec element type
+        let unsupported_vec = ScSpecTypeDef::Vec(Box::new(ScSpecTypeVec {
+            element_type: Box::new(ScSpecTypeDef::Void),
+        }));
+        let err = ramp_val(&env, &unsupported_vec, 3).unwrap_err();
+        assert!(
+            err.0.contains("isn't supported as a ramp parameter yet"),
+            "{}",
+            err.0
+        );
+    }
+
+    // ---- #497: measurement limitations in every output format ----
+
+    #[test]
+    fn export_results_json_includes_measurement_limitations_and_audit() {
+        let dir = std::env::temp_dir().join(format!("stk-export-json-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.json");
+
+        let audit = RefinementAudit {
+            initial_low: 10,
+            initial_high: 20,
+            steps: vec![RefinementStep {
+                step: 1,
+                probe_value: 15,
+                succeeded: true,
+                window_low: 15,
+                window_high: 20,
+            }],
+            final_success: 15,
+            final_failure: 16,
+        };
+
+        export_results(
+            &path,
+            Path::new("vault.wasm"),
+            "recipients",
+            "batch_payout",
+            15,
+            500_000,
+            25_000,
+            Some(&audit),
+        )
+        .unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(parsed["contract"], "vault.wasm");
+        assert_eq!(parsed["function"], "batch_payout");
+        assert_eq!(parsed["ramp"], "recipients");
+        assert_eq!(parsed["best"], 15);
+        assert_eq!(parsed["instructions"], 500_000);
+        assert_eq!(parsed["memory_bytes"], 25_000);
+        assert_eq!(parsed["measurement_limitations"], MEASUREMENT_LIMITATIONS);
+        assert_eq!(parsed["audit"]["steps"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn baseline_file_format_includes_measurement_limitations() {
+        let dir = std::env::temp_dir().join(format!("stk-limitations-base-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.baseline");
+
+        write_baseline(
+            &path,
+            Path::new("vault.wasm"),
+            "recipients",
+            "batch_payout",
+            100,
+            1_000_000,
+            50_000,
+        )
+        .unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains(&format!(
+            "measurement_limitations={MEASUREMENT_LIMITATIONS}"
+        )));
+
+        let parsed = Baseline::parse(&contents).unwrap();
+        assert_eq!(
+            parsed.measurement_limitations.as_deref(),
+            Some(MEASUREMENT_LIMITATIONS)
         );
     }
 }
