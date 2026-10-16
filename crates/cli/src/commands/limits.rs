@@ -279,6 +279,15 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+fn validate_percentage(name: &str, pct: f64) -> Result<(), CliError> {
+    if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
+        return Err(CliError(format!(
+            "{name} must be between 0 and 100 (got {pct})"
+        )));
+    }
+    Ok(())
+}
+
 fn refine_upper_bound<F>(mut low: u32, mut high: u32, probe: &mut F) -> Result<(u32, u32), CliError>
 where
     F: FnMut(u32) -> Result<bool, CliError>,
@@ -715,7 +724,7 @@ fn build_args(
     let mut vals = SVec::new(env);
     let ramp_name = function.inputs[ramp_index].name.to_utf8_string_lossy();
     for name in overrides.keys() {
-        if name == ramp_name.as_ref() {
+        if name == &ramp_name {
             return Err(CliError(format!(
                 "--arg cannot override ramp parameter {name:?}"
             )));
@@ -723,7 +732,7 @@ fn build_args(
         if !function
             .inputs
             .iter()
-            .any(|input| input.name.to_utf8_string_lossy().as_ref() == name)
+            .any(|input| input.name.to_utf8_string_lossy() == *name)
         {
             return Err(CliError(format!("--arg names unknown parameter {name:?}")));
         }
@@ -732,7 +741,7 @@ fn build_args(
         let input_name = input.name.to_utf8_string_lossy();
         let val = if i == ramp_index {
             ramp_val(env, &input.type_, ramp_value)?
-        } else if let Some(value) = overrides.get(input_name.as_ref()) {
+        } else if let Some(value) = overrides.get(input_name.as_str()) {
             explicit_val(env, &input.type_, value)?
         } else {
             default_val(env, &admin, &input.type_, input)?
@@ -762,12 +771,9 @@ fn explicit_val(env: &Env, type_: &ScSpecTypeDef, value: &str) -> Result<Val, Cl
         ScSpecTypeDef::I64 => Ok(parse!(i64)),
         ScSpecTypeDef::U128 => Ok(parse!(u128)),
         ScSpecTypeDef::I128 => Ok(parse!(i128)),
-        ScSpecTypeDef::Symbol => {
-            let string = soroban_sdk::String::from_str(env, value);
-            Symbol::try_from_val(env, &string)
-                .map(|symbol| symbol.into_val(env))
-                .map_err(|err| CliError(format!("invalid Symbol value {value:?}: {err:?}")))
-        }
+        ScSpecTypeDef::Symbol => Symbol::try_from_val(env, &value)
+            .map(|symbol| symbol.into_val(env))
+            .map_err(|err| CliError(format!("invalid Symbol value {value:?}: {err:?}"))),
         ScSpecTypeDef::String => Ok(soroban_sdk::String::from_str(env, value).into_val(env)),
         ScSpecTypeDef::Bytes => {
             let hex = value
@@ -797,7 +803,7 @@ fn explicit_val(env: &Env, type_: &ScSpecTypeDef, value: &str) -> Result<Val, Cl
 }
 
 fn decode_hex(hex: &str) -> Result<Vec<u8>, CliError> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(CliError(
             "Bytes --arg hex must contain pairs of digits".to_string(),
         ));
@@ -1323,9 +1329,10 @@ mod tests {
         let mut file = std::fs::File::create(&wasm_path).unwrap();
         file.write_all(b"mock").unwrap();
 
-        let err_result = load(&wasm_path, "nonexistent", "count");
-        assert!(err_result.is_err());
-        let err_msg = err_result.unwrap_err().0;
+        let err_msg = match load(&wasm_path, "nonexistent", "count") {
+            Err(e) => e.0,
+            Ok(_) => panic!("expected error"),
+        };
         assert!(
             err_msg.contains("failed to read contract spec"),
             "expected spec error, got: {}",
@@ -1343,9 +1350,10 @@ mod tests {
         let mut file = std::fs::File::create(&wasm_path).unwrap();
         file.write_all(b"mock").unwrap();
 
-        let err_result = load(&wasm_path, "test_func", "wrong_param");
-        assert!(err_result.is_err());
-        let err_msg = err_result.unwrap_err().0;
+        let err_msg = match load(&wasm_path, "test_func", "wrong_param") {
+            Err(e) => e.0,
+            Ok(_) => panic!("expected error"),
+        };
         assert!(
             err_msg.contains("failed to read contract spec"),
             "expected spec error early, got: {}",
@@ -1366,6 +1374,7 @@ mod tests {
             baseline_tolerance_pct: 5.0,
             save_baseline: None,
             export: None,
+            arg_values: Vec::new(),
         };
 
         let result = run(err_result);

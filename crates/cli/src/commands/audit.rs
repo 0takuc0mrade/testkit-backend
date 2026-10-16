@@ -226,7 +226,7 @@ const RULES: &[(&str, &str, &str)] = &[
 fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     match format {
         AuditOutputFormat::Text => {
-            println!("{:<40} {:<10} {}", "RULE", "SEVERITY", "DESCRIPTION");
+            println!("{:<40} {:<10} DESCRIPTION", "RULE", "SEVERITY");
             println!("{}", "-".repeat(100));
             for (rule, severity, desc) in RULES {
                 println!("{rule:<40} {severity:<10} {desc}");
@@ -425,7 +425,6 @@ fn audit_source(
 
     let suppressions = extract_suppressions(full_src);
 
-    let suppressions = Vec::new();
     let mut visitor = FunctionVisitor {
         path: path.to_path_buf(),
         findings,
@@ -439,6 +438,7 @@ fn audit_source(
 struct Suppression {
     line: usize,
     rules: Vec<String>,
+    #[allow(dead_code)]
     reason: Option<String>,
 }
 
@@ -454,8 +454,8 @@ fn extract_suppressions(src: &str) -> Vec<Suppression> {
 
                     for part in content.split(',') {
                         let part = part.trim();
-                        if part.starts_with("reason=") {
-                            reason = Some(part[7..].trim_matches('"').to_string());
+                        if let Some(stripped) = part.strip_prefix("reason=") {
+                            reason = Some(stripped.trim_matches('"').to_string());
                         } else if !part.is_empty() && part != "skip" {
                             rules.push(part.to_string());
                         }
@@ -633,12 +633,11 @@ impl FunctionVisitor<'_> {
 
         // Check if this finding is suppressed
         for suppression in self.suppressions {
-            if (suppression.line == line || suppression.line == line - 1) {
-                if suppression.rules.contains(&"*".to_string())
-                    || suppression.rules.iter().any(|r| r == rule)
-                {
-                    return;
-                }
+            if (suppression.line == line || suppression.line == line - 1)
+                && (suppression.rules.contains(&"*".to_string())
+                    || suppression.rules.iter().any(|r| r == rule))
+            {
+                return;
             }
         }
 
@@ -1059,12 +1058,10 @@ mod tests {
 
         let file = syn::parse_file(code).unwrap();
         let suppressions = Vec::new();
-        let suppressions = Vec::new();
         let mut visitor = FunctionVisitor {
             path: PathBuf::from("test.rs"),
             findings: &mut findings,
             config: &config,
-            suppressions: &suppressions,
             suppressions: &suppressions,
         };
         visitor.visit_file(&file);
