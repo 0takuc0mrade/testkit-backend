@@ -1,10 +1,37 @@
+//! Adversarial value generators for **signed** money math.
+//!
+//! Stellar contracts model token amounts as a signed [`i128`]: a negative
+//! amount is a meaningful value (a debit, a refund, or the result of a
+//! subtraction), not an error to be filtered out. Every generator in this
+//! module that produces an *amount* therefore works in signed [`i128`] and
+//! deliberately includes the signed extremes, because a subtraction that
+//! reaches the negative boundary is exactly the class of bug these values
+//! exist to catch:
+//!
+//! - [`adversarial_amounts`] returns `-1` and both [`i128::MIN`] and
+//!   `i128::MIN + 1`.
+//! - [`amounts_in`] draws from a signed, inclusive `[min, max]` range, so a
+//!   caller asking for `[-100, 100]` gets negative draws as well as positive
+//!   ones.
+//! - [`overflow_edge_triples`] carries a signed amount alongside its duration
+//!   and rate.
+//!
+//! The one exception is [`bps_values`]: a basis-point *fraction* is a [`u32`]
+//! and cannot be negative, so its adversarial coverage is out-of-range large
+//! values (`10_001`, [`u32::MAX`]) rather than signed extremes.
+
 use crate::core::TestEnv;
 
 /// Values chosen to break money math: `0`, `1`, `-1`, [`i128::MAX`],
-/// [`i128::MIN`], `i128::MAX - 1`, stroop boundaries (`10^7`, the standard
-/// Stellar asset decimal count), and values around the midpoint of the
-/// `i128` range, which is where naive `amount * rate` multiplications
-/// before a `/ bps_denominator` division tend to overflow first.
+/// [`i128::MIN`], `i128::MAX - 1`, [`i128::MIN`] `+ 1`, stroop boundaries
+/// (`10^7`, the standard Stellar asset decimal count), and values around the
+/// midpoint of the `i128` range, which is where naive `amount * rate`
+/// multiplications before a `/ bps_denominator` division tend to overflow
+/// first.
+///
+/// The amounts are **signed** [`i128`] values: `-1`, [`i128::MIN`], and
+/// [`i128::MIN`] `+ 1` are included on purpose, so a contract that mishandles
+/// negative balances, refunds, or debits is exercised rather than skipped.
 ///
 /// # Example
 ///
@@ -35,8 +62,16 @@ pub fn adversarial_amounts() -> Vec<i128> {
     ]
 }
 
-/// Random amounts in `[min, max]`, seeded from `env` so that a test using
-/// [`TestEnv::with_seed`] gets the same amounts on every run.
+/// Random **signed** amounts in the inclusive range `[min, max]`, seeded from
+/// `env` so that a test using [`TestEnv::with_seed`] gets the same amounts on
+/// every run.
+///
+/// Because the range is signed, `min` may be negative: `amounts_in(&env,
+/// -100, -1, n)` yields only negative amounts, and `amounts_in(&env, -100,
+/// 100, n)` draws from both sides of zero. This mirrors contract math where a
+/// negative amount is a valid debit, refund, or subtraction result.
+///
+/// Panics if `min > max`.
 ///
 /// # Example
 ///
@@ -51,6 +86,10 @@ pub fn adversarial_amounts() -> Vec<i128> {
 ///
 /// let again = amounts_in(&TestEnv::with_seed(7), 0, 100, 5);
 /// assert_eq!(amounts, again);
+///
+/// // Signed ranges can produce negative amounts:
+/// let debits = amounts_in(&env, -100, -1, 5);
+/// assert!(debits.iter().all(|a| (-100..=-1).contains(a)));
 /// ```
 pub fn amounts_in(env: &TestEnv, min: i128, max: i128, n: usize) -> Vec<i128> {
     assert!(
@@ -80,6 +119,12 @@ pub fn amounts_in(env: &TestEnv, min: i128, max: i128, n: usize) -> Vec<i128> {
 /// past the point where it would overflow `i128` — the pattern used by
 /// interest and streaming-payout accrual math.
 ///
+/// The amount component is a **signed** [`i128`] (the same representation a
+/// contract uses for balances and deltas); the duration is an unsigned [`u64`]
+/// and the rate is a signed [`i128`]. The triples pin the exact `i128`
+/// boundaries so a contract's accrual path is checked where it is most likely
+/// to overflow.
+///
 /// # Example
 ///
 /// ```
@@ -106,6 +151,12 @@ pub fn overflow_edge_triples() -> Vec<(i128, u64, i128)> {
 
 /// Basis-point values worth testing: `0`, `1`, `9999`, `10000` (100%), and
 /// values past the valid range that a contract should reject.
+///
+/// Unlike the amount generators, this one is **unsigned**: a basis-point
+/// *fraction* is a [`u32`] by definition (`10_000` bps = 100%), so it has no
+/// negative members. Its adversarial coverage is therefore the out-of-range
+/// large values (`10_001`, [`u32::MAX`]) a contract must reject, not signed
+/// extremes.
 ///
 /// # Example
 ///
@@ -159,11 +210,44 @@ mod tests {
     }
 
     #[test]
+    fn adversarial_amounts_includes_every_signed_extreme() {
+        let amounts = adversarial_amounts();
+        // The signed minimum boundaries are present so negative-overflow
+        // paths are exercised, not merely documented.
+        for expected in [-1, i128::MIN, i128::MIN + 1] {
+            assert!(
+                amounts.contains(&expected),
+                "adversarial_amounts() must include the signed boundary {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn amounts_in_stays_within_bounds() {
         let env = TestEnv::with_seed(1);
         let amounts = amounts_in(&env, -50, 50, 200);
         assert_eq!(amounts.len(), 200);
         assert!(amounts.iter().all(|a| (-50..=50).contains(a)));
+    }
+
+    #[test]
+    fn amounts_in_can_draw_negative_amounts_from_a_signed_range() {
+        let env = TestEnv::with_seed(5);
+        let amounts = amounts_in(&env, -100, -1, 64);
+        assert_eq!(amounts.len(), 64);
+        assert!(
+            amounts.iter().all(|a| (-100..=-1).contains(a)),
+            "every draw from the range [-100, -1] must be negative: {amounts:?}"
+        );
+        assert!(amounts.iter().any(|&a| a < 0));
+    }
+
+    #[test]
+    fn amounts_in_spans_both_sides_of_zero() {
+        let env = TestEnv::with_seed(11);
+        let amounts = amounts_in(&env, -1_000, 1_000, 500);
+        assert!(amounts.iter().any(|&a| a < 0), "expected negative draws");
+        assert!(amounts.iter().any(|&a| a > 0), "expected positive draws");
     }
 
     #[test]
@@ -199,5 +283,14 @@ mod tests {
             assert!(values.contains(&expected));
         }
         assert!(values.iter().any(|&v| v > 10_000));
+    }
+
+    #[test]
+    fn bps_values_are_unsigned_and_cover_the_upper_range() {
+        // bps_values returns `u32`, so negatives are unrepresentable by type;
+        // adversarial coverage is the out-of-range large values instead.
+        let values: Vec<u32> = bps_values();
+        assert!(values.contains(&10_001));
+        assert!(values.contains(&u32::MAX));
     }
 }
