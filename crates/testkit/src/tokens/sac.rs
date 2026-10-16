@@ -15,6 +15,15 @@ const SAC_DECIMALS: u32 = 7;
 
 /// A deployed Stellar Asset Contract test double, with one-line mint/balance
 /// helpers so tests don't hand-roll SAC setup boilerplate.
+///
+/// # Administrative authorization
+///
+/// The double deploys the SAC with a fresh test address as its admin and
+/// mocks that admin's authorization for [`TestToken::mint`] /
+/// [`TestToken::mint_raw`] only — minting therefore works with no global auth
+/// mocking enabled. Every other operation (transfers, burns, approvals) still
+/// needs the test to authorize the caller with `mock_all_auths` or a per-call
+/// `mock_auths`; see [`crate::tokens`] for the same rule stated module-wide.
 pub struct TestToken {
     env: Env,
     address: Address,
@@ -45,6 +54,9 @@ impl TestToken {
 
     /// Mint `amount` **whole units** to `to` (converted internally to base
     /// units, i.e. `amount * 10^decimals`).
+    ///
+    /// The Stellar Asset Contract admin's authorization is mocked for this
+    /// call, so it succeeds with no global auth mocking enabled.
     ///
     /// # Panics
     ///
@@ -82,6 +94,9 @@ impl TestToken {
     /// Mint `amount` **base units** (stroops) to `to`, with no unit
     /// conversion.
     ///
+    /// The Stellar Asset Contract admin's authorization is mocked for this
+    /// call, so it succeeds with no global auth mocking enabled.
+    ///
     /// # Example
     ///
     /// ```
@@ -109,12 +124,12 @@ impl TestToken {
         self.total_tracked.set(self.total_tracked.get() + amount);
     }
 
-    /// The base-unit balance of `of`.
+    /// The balance of `of`, in **base units**.
     pub fn balance(&self, of: &Address) -> i128 {
         TokenClient::new(&self.env, &self.address).balance(of)
     }
 
-    /// Assert that `of`'s base-unit balance equals `expected`.
+    /// Assert that `of`'s balance equals `expected`, in **base units**.
     ///
     /// # Panics
     ///
@@ -145,7 +160,7 @@ impl TestToken {
         }
     }
 
-    /// Total base units minted through this `TestToken` (via
+    /// Total **base units** minted through this `TestToken` (via
     /// [`TestToken::mint`] or [`TestToken::mint_raw`]) across every
     /// recipient — for supply-conservation assertions.
     ///
@@ -166,7 +181,12 @@ impl TestToken {
 }
 
 impl TestEnv {
-    /// Deploy a Stellar Asset Contract with the standard 7 decimals.
+    /// Deploy a Stellar Asset Contract with the standard 7 decimals, using a
+    /// fresh test address as its admin.
+    ///
+    /// The admin's authorization is mocked for minting, so [`TestToken::mint`]
+    /// / [`TestToken::mint_raw`] need no global auth mocking; other operations
+    /// still do — see [`crate::tokens`].
     ///
     /// # Example
     ///
@@ -245,6 +265,38 @@ mod tests {
 
         token.assert_balance(&alice, 70);
         token.assert_balance(&bob, 30);
+    }
+
+    #[test]
+    fn mint_works_with_no_global_auth_mocking() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+
+        // No mock_all_auths/mock_auths anywhere: the double mocks the SAC
+        // admin's authorization for mint itself.
+        token.mint(&alice, 2);
+        token.mint_raw(&alice, 42);
+
+        token.assert_balance(&alice, 2 * 10i128.pow(7) + 42);
+    }
+
+    #[test]
+    fn transfers_still_require_authorization() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+        token.mint_raw(&alice, 100);
+
+        // Only minting is mocked; an un-authorized transfer must still fail.
+        env.assert_requires_auth(|| {
+            TokenClient::new(env.env(), &token.address()).transfer(
+                &alice,
+                soroban_sdk::MuxedAddress::from(bob.clone()),
+                &10,
+            );
+        });
     }
 
     #[test]
