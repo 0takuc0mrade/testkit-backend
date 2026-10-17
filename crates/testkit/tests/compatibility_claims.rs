@@ -16,7 +16,11 @@ fn compatibility_matrix_reflects_pinned_sdk_and_workspace_version() {
         .find_map(|line| {
             let trimmed = line.trim();
             if trimmed.starts_with("soroban-sdk = ") {
-                Some(trimmed.trim_start_matches("soroban-sdk = ").trim_matches('"'))
+                Some(
+                    trimmed
+                        .trim_start_matches("soroban-sdk = ")
+                        .trim_matches('"'),
+                )
             } else {
                 None
             }
@@ -54,7 +58,11 @@ fn cli_soroban_spec_matches_workspace_soroban_sdk() {
         .find_map(|line| {
             let trimmed = line.trim();
             if trimmed.starts_with("soroban-sdk = ") {
-                Some(trimmed.trim_start_matches("soroban-sdk = ").trim_matches('"'))
+                Some(
+                    trimmed
+                        .trim_start_matches("soroban-sdk = ")
+                        .trim_matches('"'),
+                )
             } else {
                 None
             }
@@ -67,7 +75,11 @@ fn cli_soroban_spec_matches_workspace_soroban_sdk() {
         .find_map(|line| {
             let trimmed = line.trim();
             if trimmed.starts_with("soroban-spec = ") {
-                Some(trimmed.trim_start_matches("soroban-spec = ").trim_matches('"'))
+                Some(
+                    trimmed
+                        .trim_start_matches("soroban-spec = ")
+                        .trim_matches('"'),
+                )
             } else {
                 None
             }
