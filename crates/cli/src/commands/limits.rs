@@ -139,6 +139,10 @@ pub struct LimitsSummary {
     /// Why that first failure happened, standardized for every report.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_failure_category: Option<ProbeFailureCategory>,
+    /// Stderr captured from the first failing probe, providing
+    /// actionable context for why the ceiling was hit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_failed_probe_stderr: Option<String>,
     /// How many probes failed in each category over the whole run.
     #[serde(skip_serializing_if = "map_is_empty")]
     pub probe_failure_counts: BTreeMap<ProbeFailureCategory, usize>,
@@ -182,6 +186,12 @@ impl LimitsSummary {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("  probe failures: {counts}\n"));
+        }
+        if let Some(stderr) = &self.first_failed_probe_stderr {
+            let trimmed = stderr.trim();
+            if !trimmed.is_empty() {
+                out.push_str(&format!("  first failing probe stderr: {trimmed}\n"));
+            }
         }
         if let Some(audit) = &self.audit {
             out.push_str(&format!(
@@ -391,6 +401,7 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     let mut probe_failure_counts: BTreeMap<ProbeFailureCategory, usize> = BTreeMap::new();
     let mut last_failed_probe: Option<u32> = None;
     let mut last_failure_category: Option<ProbeFailureCategory> = None;
+    let mut first_failed_probe_stderr: Option<String> = None;
     let mut hit_upper_bound = false;
 
     let mut probe = |value: u32| -> Result<ProbeOutcome, CliError> {
@@ -410,7 +421,7 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
                     .flat_map(|value| ["--arg", value.as_str()]),
             )
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|err| {
                 CliError(format!(
@@ -433,6 +444,22 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         };
         if let ProbeOutcome::Failed(category) = outcome {
             *probe_failure_counts.entry(category).or_insert(0) += 1;
+            // Capture the child's stderr the first time a probe fails, so the
+            // report carries actionable context about *why* the ceiling was
+            // hit rather than silently discarding it. Only the first failure
+            // is retained: later failures in the same run typically have the
+            // same root cause, and keeping one keeps the report concise.
+            if first_failed_probe_stderr.is_none() {
+                if let Ok(stderr) = child.stderr.take().map_or(Ok(String::new()), |mut s| {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    s.read_to_string(&mut buf).map(|_| buf)
+                }) {
+                    if !stderr.trim().is_empty() {
+                        first_failed_probe_stderr = Some(stderr);
+                    }
+                }
+            }
         }
         Ok(outcome)
     };
@@ -474,8 +501,15 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
             ),
             None => String::new(),
         };
+        let stderr_note = first_failed_probe_stderr
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("; probe stderr: {s}"))
+            .unwrap_or_default();
         return Err(CliError(format!(
-            "{:?} failed even at the smallest ramp value (1) for parameter {:?}{category_note}; \
+            "{:?} failed even at the smallest ramp value (1) for parameter {:?}{category_note}\
+             {stderr_note}; \
              this usually indicates a validation error in the contract rather than a \
              resource limit — check the contract's parameter validation logic and retry",
             args.function, args.ramp
@@ -527,6 +561,7 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         memory_bytes,
         first_failed,
         first_failure_category,
+        first_failed_probe_stderr,
         probe_failure_counts,
         hit_upper_bound,
         probe_timeout_secs: args.probe_timeout,
@@ -1229,7 +1264,15 @@ fn explicit_val(env: &Env, type_: &ScSpecTypeDef, value: &str) -> Result<Val, Cl
                 .strip_prefix("0x")
                 .ok_or_else(|| CliError("Bytes --arg values must start with 0x".to_string()))?;
             let bytes = decode_hex(hex)?;
-            Ok(soroban_sdk::Bytes::from_slice(env, &bytes).into_val(env))
+            // An empty override (0x with no digits) must produce the same
+            // empty `Bytes` that `default_val` and `vec_element_val` use
+            // (`Bytes::new`), not `Bytes::from_slice(&[])`, which serializes
+            // to invalid XDR for the zero-length case.
+            if bytes.is_empty() {
+                Ok(soroban_sdk::Bytes::new(env).into_val(env))
+            } else {
+                Ok(soroban_sdk::Bytes::from_slice(env, &bytes).into_val(env))
+            }
         }
         ScSpecTypeDef::Address => {
             let strkey = value
@@ -1523,6 +1566,7 @@ mod tests {
             memory_bytes: 50_000,
             first_failed: Some(101),
             first_failure_category: Some(ProbeFailureCategory::ExitFailure),
+            first_failed_probe_stderr: None,
             probe_failure_counts: BTreeMap::from([(ProbeFailureCategory::ExitFailure, 1)]),
             hit_upper_bound: false,
             probe_timeout_secs: 30,
@@ -2169,6 +2213,7 @@ mod tests {
             memory_bytes: 25_000,
             first_failed: Some(16),
             first_failure_category: Some(ProbeFailureCategory::ExitFailure),
+            first_failed_probe_stderr: None,
             probe_failure_counts: BTreeMap::from([(ProbeFailureCategory::ExitFailure, 1)]),
             audit: Some(audit),
             ..sample_summary()
@@ -2200,6 +2245,7 @@ mod tests {
             memory_bytes: 25_000,
             first_failed: Some(16),
             first_failure_category: Some(ProbeFailureCategory::TimedOut),
+            first_failed_probe_stderr: None,
             probe_failure_counts: BTreeMap::from([
                 (ProbeFailureCategory::ExitFailure, 2),
                 (ProbeFailureCategory::TimedOut, 1),
@@ -2292,6 +2338,119 @@ mod tests {
         assert_eq!(
             parsed.measurement_limitations.as_deref(),
             Some(MEASUREMENT_LIMITATIONS)
+        );
+    }
+
+    // ---- Bug: handle empty Bytes overrides without producing invalid XDR ----
+
+    #[test]
+    fn explicit_val_empty_bytes_override_produces_valid_empty_bytes() {
+        let env = Env::default();
+        // 0x with no hex digits — the regression input. Must produce the
+        // same empty Bytes that `Bytes::new` does, not invalid XDR.
+        let val = explicit_val(&env, &ScSpecTypeDef::Bytes, "0x").unwrap();
+        let bytes: soroban_sdk::Bytes = val.into_val(&env);
+        assert_eq!(bytes.len(), 0);
+    }
+
+    #[test]
+    fn explicit_val_nonempty_bytes_override_still_works() {
+        let env = Env::default();
+        let val = explicit_val(&env, &ScSpecTypeDef::Bytes, "0xdeadbeef").unwrap();
+        let bytes: soroban_sdk::Bytes = val.into_val(&env);
+        assert_eq!(bytes.len(), 4);
+    }
+
+    #[test]
+    fn explicit_val_single_byte_bytes_override() {
+        // Edge case: a one-byte (two hex digit) value.
+        let env = Env::default();
+        let val = explicit_val(&env, &ScSpecTypeDef::Bytes, "0x00").unwrap();
+        let bytes: soroban_sdk::Bytes = val.into_val(&env);
+        assert_eq!(bytes.len(), 1);
+    }
+
+    #[test]
+    fn explicit_val_bytes_override_rejects_missing_prefix() {
+        let env = Env::default();
+        let err = explicit_val(&env, &ScSpecTypeDef::Bytes, "deadbeef").unwrap_err();
+        assert!(err.0.contains("must start with 0x"), "{}", err.0);
+    }
+
+    #[test]
+    fn explicit_val_empty_bytes_matches_default_val() {
+        // The empty override should produce the same empty Bytes that the
+        // default path (which uses `Bytes::new`) produces.
+        let env = Env::default();
+        let override_val: soroban_sdk::Bytes = explicit_val(&env, &ScSpecTypeDef::Bytes, "0x")
+            .unwrap()
+            .into_val(&env);
+        let default_val: soroban_sdk::Bytes = soroban_sdk::Bytes::new(&env).into_val(&env);
+        assert_eq!(default_val.len(), 0);
+        assert_eq!(override_val.len(), 0);
+    }
+
+    // ---- Bug: retain stderr context from a failed wasm probe ----
+
+    #[test]
+    fn limits_summary_renders_first_failed_probe_stderr() {
+        let summary = LimitsSummary {
+            first_failed: Some(10),
+            first_failure_category: Some(ProbeFailureCategory::ExitFailure),
+            first_failed_probe_stderr: Some("contract panicked: overflow".to_string()),
+            ..sample_summary()
+        };
+        let text = summary.render_text();
+        assert!(
+            text.contains("first failing probe stderr: contract panicked: overflow"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn limits_summary_omits_stderr_line_when_empty() {
+        let summary = LimitsSummary {
+            first_failed_probe_stderr: Some("   \n  ".to_string()),
+            ..sample_summary()
+        };
+        let text = summary.render_text();
+        assert!(
+            !text.contains("first failing probe stderr"),
+            "whitespace-only stderr should not render: {text}"
+        );
+    }
+
+    #[test]
+    fn limits_summary_omits_stderr_line_when_none() {
+        let summary = LimitsSummary {
+            first_failed_probe_stderr: None,
+            ..sample_summary()
+        };
+        let text = summary.render_text();
+        assert!(!text.contains("first failing probe stderr"), "{text}");
+    }
+
+    #[test]
+    fn limits_summary_includes_failed_probe_stderr_in_json() {
+        let summary = LimitsSummary {
+            first_failed_probe_stderr: Some("host abort".to_string()),
+            ..sample_summary()
+        };
+        let json: serde_json::Value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["first_failed_probe_stderr"], "host abort");
+    }
+
+    #[test]
+    fn limits_summary_omits_stderr_from_json_when_none() {
+        let summary = LimitsSummary {
+            first_failed_probe_stderr: None,
+            ..sample_summary()
+        };
+        let json: serde_json::Value = serde_json::to_value(&summary).unwrap();
+        assert!(
+            json.get("first_failed_probe_stderr").is_none()
+                || json["first_failed_probe_stderr"].is_null(),
+            "stderr should be skipped when None: {json}"
         );
     }
 }
