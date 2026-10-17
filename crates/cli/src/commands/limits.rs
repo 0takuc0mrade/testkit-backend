@@ -1810,6 +1810,73 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn shell_quote_protects_paths_with_spaces_and_single_quotes() {
+        assert_eq!(shell_quote("vault.wasm"), "vault.wasm");
+        assert_eq!(shell_quote("my dir/vault.wasm"), "'my dir/vault.wasm'");
+        assert_eq!(shell_quote("can't run.wasm"), "'can'\\''t run.wasm'");
+        assert_eq!(shell_quote("$(touch bad)"), "'$(touch bad)'");
+        let guide = build_reproduction_guidance(
+            "my dir/can't run.wasm",
+            "batch_payout",
+            "recipients",
+            3,
+            &["memo=hello world".into()],
+        );
+        assert!(guide.contains("--contract 'my dir/can'\\''t run.wasm'"));
+        assert!(guide.contains("--arg 'memo=hello world'"));
+    }
+
+    #[test]
+    fn completed_probe_retains_actual_nonzero_exit_status() {
+        let mut child = Command::new("sh").args(["-c", "exit 17"]).spawn().unwrap();
+        let status = wait_with_timeout(&mut child, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code(), Some(17));
+        assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(17));
+    }
+
+    #[test]
+    fn timed_out_probe_is_killed_and_reaped() {
+        let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+        assert!(wait_with_timeout(&mut child, Duration::from_millis(40))
+            .unwrap()
+            .is_none());
+        assert!(child.try_wait().unwrap().is_some(), "child must be reaped");
+    }
+
+    #[test]
+    fn abandoned_probe_guard_prevents_late_artifacts() {
+        let root = std::env::temp_dir().join(format!("stk-interrupted-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("late-artifact");
+        let child = Command::new("sh")
+            .args(["-c", "sleep 1; touch \"$1\"", "_"])
+            .arg(&marker)
+            .current_dir(&root)
+            .spawn()
+            .unwrap();
+        {
+            // Simulates an early return/error: the guard kills the child.
+            let _probe = ProbeChild { child };
+        }
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(!marker.exists(), "an abandoned probe wrote after Drop");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn oversized_timeout_is_actionable_and_guard_still_reaps() {
+        let child = Command::new("sleep").arg("10").spawn().unwrap();
+        let mut guard = ProbeChild { child };
+        let err = wait_with_timeout(&mut guard.child, Duration::MAX).unwrap_err();
+        assert!(err.0.contains("too large for the host clock"), "{}", err.0);
+        drop(guard);
+    }
+
     // ---- #244: export results ----
 
     #[test]
