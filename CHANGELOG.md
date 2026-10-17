@@ -89,6 +89,15 @@ section, so a merge can never land without a place to record the change.
 - The `limits` subcommand now mocks authorization on each isolated probe
   and defaults numeric ramp parameters to a non-zero value, making it
   usable against real auth-gated payout contracts out of the box.
+- `AuthMatrix` docs now state that repeated callers are de-duplicated and
+  that entry-point names may be reused to check one function under several
+  setups, each producing its own reported section.
+- `soroban_testkit::tokens` docs now name the unit (whole units vs base
+  units/stroops) on every method and state that the SAC admin's authorization
+  is mocked for `mint`/`mint_raw` only, not for other operations.
+- `soroban_testkit::ttl` docs now spell out per-storage-kind behavior against
+  the pinned SDK: temporary entries are deleted on expiry, while persistent
+  and instance entries are archived and restored on next read.
 
 ### Fixed
 
@@ -98,7 +107,14 @@ section, so a merge can never land without a place to record the change.
 - Rebuild the limits test fixture before use and reject failed rebuilds even
   when an older WASM artifact exists (#449).
 - Explain how to recover from a missing or unreadable `--contract` file (#450).
-
+- Keep `audit` findings and baseline paths relative to the workspace, and
+  discover rule configuration consistently for directories, files, and stdin
+  (#428). Continue scanning readable files after source or traversal errors,
+  while returning a non-zero status for incomplete scans (#425). Distinguish
+  Rust, TOML, and JSON parse diagnostics from file-access errors and include
+  the affected path and available source location (#426). Guard JSON escaping
+  of control characters in paths and diagnostic fields with regression
+  coverage (#424).
 - `TestEnv::at` now enters its scope with a coherent ledger position: the
   sequence number is derived from the scoped timestamp and the environment's
   ledger close interval (saturating at the ends of the range) instead of

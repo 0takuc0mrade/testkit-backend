@@ -124,12 +124,45 @@ read/write counts and transaction size aren't reported (they come from a
 network-side simulated footprint this crate doesn't produce); instructions
 and memory, measured locally, are.
 
+Probe execution uses the already-built `soroban-testkit` executable directly,
+not `cargo run` or a throwaway Cargo project. Each probe child is killed and
+reaped on timeout; an early ordinary error/return also invokes a cleanup
+guard. This guard cannot run if the operating system forcibly kills the
+parent process. Contract paths are passed as single OS arguments; copyable
+reproduction instructions shell-quote paths containing spaces or quotes.
+
 `audit` accepts three scan roots: a crate directory (walked recursively for
 `.rs` files), a single `.rs` file, or `-` to read Rust source from stdin.
 While walking a directory it skips `target/`, `node_modules/`, and hidden
 directories such as `.git/` and `.github/`, so build output and vendored or
 tooling code is never reported. A path that doesn't exist is an actionable
 error rather than an empty "no findings" run.
+
+Findings use paths relative to the Cargo workspace root (or the repository
+root or crate root when there is no workspace). The nearest
+`.soroban-testkit.toml` or `soroban-testkit.toml` between the scanned source
+directory and that root supplies rule configuration; the dotted name takes
+precedence in the same directory. Single-file scans start config discovery
+at the file's parent, and stdin scans start at the current directory.
+`--baseline baseline.json` resolves the baseline file from the current
+directory, while its `file` entries are workspace-relative, so one baseline
+works from member crates too. Absolute entries are also accepted.
+
+Unreadable files, directory traversal failures, and Rust parse errors are
+reported separately on stderr with the affected path (and line/column for
+syntax errors). The scan continues through other files and writes their
+findings in the requested format, then exits non-zero to signal an
+incomplete audit even without `--strict`. Fix these errors before treating
+an empty report as a clean scan. JSON reports escape control characters in
+file names and diagnostic text.
+
+**Audit limitation:** the linter inspects written Rust source only. It does
+not expand procedural macros (including Soroban contract macros) or
+`macro_rules!`, so generated entry points and generated bodies may go
+unexamined. A clean report does not certify generated code. The limitation
+is included in text, JSON (`summary.limitations`) and SARIF
+(`runs[].properties.limitations`) results. Inspect expanded source
+separately when generated code matters.
 
 ## Status
 

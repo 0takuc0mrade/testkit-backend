@@ -32,6 +32,11 @@ fn ensure_vault_wasm() -> PathBuf {
         let wasm = workspace_root().join("target/wasm32v1-none/release/vault.wasm");
         let mut build = Command::new("cargo");
         build
+            // The outer cargo-llvm-cov run instruments native tests. This nested
+            // WASM fixture build must not inherit its unsupported coverage flags.
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("CARGO_TARGET_WASM32V1_NONE_RUSTFLAGS")
             .args([
                 "build",
                 "-p",
@@ -568,6 +573,36 @@ fn limits_rejects_a_directory_as_contract() {
     assert!(output.stdout.is_empty());
 }
 
+#[test]
+fn limits_launches_wasm_from_a_path_with_spaces_without_shell_splitting() {
+    let wasm = ensure_vault_wasm();
+    let root = std::env::temp_dir().join(format!("stk limit paths {}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let copy = root.join("contract copy.wasm");
+    std::fs::copy(&wasm, &copy).unwrap();
+
+    let output = run(&[
+        "limits",
+        "--contract",
+        copy.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("--contract 'contract copy.wasm'"),
+        "copyable guidance must quote the filename: {stdout}"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn fixture_rebuild_never_falls_back_to_stale_wasm() {
@@ -603,4 +638,39 @@ fn fixture_rebuild_never_falls_back_to_stale_wasm() {
         .unwrap_err()
         .contains("failed to build"));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn limits_timeout_creates_no_temporary_cargo_probe_project() {
+    let wasm = ensure_vault_wasm();
+    let root = std::env::temp_dir().join(format!("stk-probe-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"))
+        .args([
+            "limits",
+            "--contract",
+            wasm.to_str().unwrap(),
+            "--fn",
+            "batch_payout",
+            "--ramp",
+            "recipients",
+            "--probe-timeout",
+            "0",
+        ])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    // Either the immediate deadline fails the first probe, or a very fast
+    // probe may complete; neither outcome creates a disposable Cargo project.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() || stderr.contains("timed-out"),
+        "unexpected probe error: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&root).unwrap().count(),
+        0,
+        "limits must not leave probe Cargo.toml/src/target directories"
+    );
+    std::fs::remove_dir(&root).unwrap();
 }

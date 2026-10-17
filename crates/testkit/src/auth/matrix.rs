@@ -56,6 +56,20 @@ impl<'a> AuthMatrix<'a> {
     /// `invoke` is typically built from a generated client's `try_*`
     /// method with the candidate address mocked as the caller — see
     /// [`AuthMatrix::assert_enforced`]'s example.
+    ///
+    /// # Duplicates
+    ///
+    /// Repeating an address in `allowed` is harmless: the matrix de-duplicates
+    /// addresses before building its grid, so a duplicated caller is still
+    /// checked exactly once per entry point rather than being counted (or
+    /// reported) twice.
+    ///
+    /// Entry-point *names* are not required to be unique. Registering the same
+    /// name twice produces two independently-checked sections in the report —
+    /// useful when one contract function is expected to behave differently
+    /// under two different setups — but the failure message will name both
+    /// with the same string, so give them distinct names unless the
+    /// duplication is deliberate.
     pub fn entry_point(
         mut self,
         name: &str,
@@ -125,6 +139,10 @@ impl<'a> AuthMatrix<'a> {
     /// For every registered entry point, assert every allowed address
     /// succeeds and every other **known actor** (see [`AuthMatrix`] and
     /// [`AuthMatrix::known_actors`]) fails.
+    ///
+    /// Known addresses are de-duplicated, so an address listed more than once
+    /// — on one entry point or across several — is still checked (and counted)
+    /// exactly once per entry point.
     ///
     /// # Panics
     ///
@@ -473,6 +491,58 @@ mod tests {
                 },
             )
             .assert_enforced();
+    }
+
+    #[test]
+    fn a_duplicated_allowed_address_is_checked_once_not_twice() {
+        let env = TestEnv::new();
+        let alice = env.address();
+
+        // The same actor listed twice in one `allowed` list must still count
+        // as a single known address: the report should cover one cell, not two.
+        let matrix =
+            AuthMatrix::new(&env).entry_point("dup", &[alice.clone(), alice.clone()], |_| {
+                Err(soroban_sdk::Error::from_contract_error(1))
+            });
+
+        let err =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| matrix.assert_enforced()))
+                .expect_err("alice is expected to pass but is rejected");
+        let message = panic_message(err);
+
+        assert!(
+            message.contains("of 1 cells"),
+            "a duplicated actor must be counted once: {message}"
+        );
+    }
+
+    #[test]
+    fn duplicate_entry_point_names_produce_independent_sections() {
+        let env = TestEnv::new();
+        let alice = env.address();
+
+        // Deliberately reusing a name: both sections are checked separately,
+        // one violating and one passing, and both appear in the report.
+        let matrix = AuthMatrix::new(&env)
+            .entry_point("deposit", std::slice::from_ref(&alice), |_| {
+                Err(soroban_sdk::Error::from_contract_error(1))
+            })
+            .entry_point("deposit", std::slice::from_ref(&alice), |_| Ok(()));
+
+        let err =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| matrix.assert_enforced()))
+                .expect_err("the first `deposit` rejects alice and must be flagged");
+        let message = panic_message(err);
+
+        assert_eq!(
+            message.matches("[deposit]").count(),
+            2,
+            "two entry points sharing a name must both be reported: {message}"
+        );
+        assert!(
+            message.contains("of 2 cells"),
+            "each same-named entry point still gets its own cells: {message}"
+        );
     }
 
     #[test]
