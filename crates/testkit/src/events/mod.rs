@@ -15,4 +15,4 @@
 mod assertions;
 mod capture;
 
-pub use capture::{CapturedEvent, EventLog};
+pub use capture::{decode_topic_diagnostic, decode_val_diagnostic, CapturedEvent, EventLog};

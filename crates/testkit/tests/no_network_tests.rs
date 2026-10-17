@@ -53,3 +53,26 @@ fn ci_runs_the_test_suite_with_the_network_removed() {
          isolation wrapper must wrap the actual suite, not an empty command."
     );
 }
+
+#[test]
+fn test_no_network_script_avoids_masking_doctests_behind_all_targets() {
+    let script = read_repo_file(".github/scripts/test-no-network.sh");
+
+    // all-targets must execute --doc as well, because `cargo test --all-targets`
+    // excludes doctests by cargo design.
+    assert!(
+        script.contains("--all-targets --locked") && script.contains("--doc --locked"),
+        "test-no-network.sh must include --doc in its all-targets target so failed \
+         doctests are not silently masked."
+    );
+}
+
+#[test]
+fn test_no_network_script_preserves_cargo_exit_status() {
+    let script = read_repo_file(".github/scripts/test-no-network.sh");
+
+    assert!(
+        script.contains("exit \"$status\""),
+        "test-no-network.sh must exit with the original status code of the cargo command."
+    );
+}

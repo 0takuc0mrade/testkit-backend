@@ -64,14 +64,65 @@ impl TestToken {
     /// token.mint(&alice, 100);
     /// token.assert_balance(&alice, 1_000_000_000); // 100 * 10^7
     /// ```
+    /// Convert `amount` whole units into base units (stroops) at this token's decimal precision.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// assert_eq!(token.to_base_units(5).unwrap(), 50_000_000);
+    /// ```
+    pub fn to_base_units(&self, whole: i128) -> Result<i128, TestkitError> {
+        whole_to_base_units(whole, self.decimals())
+    }
+
+    /// Convert `base` units into whole units at this token's decimal precision.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// assert_eq!(token.to_whole_units(50_000_000).unwrap(), 5);
+    /// ```
+    pub fn to_whole_units(&self, base: i128) -> Result<i128, TestkitError> {
+        base_to_whole_units(base, self.decimals())
+    }
+
+    /// Mint `amount` **whole units** to `to` (converted internally to base
+    /// units, i.e. `amount * 10^decimals`).
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::Misuse`] if the conversion to base
+    /// units would overflow `i128`, or if the contract invocation fails or traps.
+    /// Use [`TestToken::mint_raw`] for amounts already in base units, or
+    /// [`TestToken::try_mint`] for fallible invocations.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// let alice = env.address();
+    ///
+    /// token.mint(&alice, 100);
+    /// token.assert_balance(&alice, 1_000_000_000); // 100 * 10^7
+    /// ```
     pub fn mint(&self, to: &Address, amount: i128) {
-        let scale = 10i128.pow(self.decimals());
-        let raw = amount.checked_mul(scale).unwrap_or_else(|| {
+        let raw = self.to_base_units(amount).unwrap_or_else(|err| {
             panic!(
                 "{}",
                 TestkitError::Misuse(format!(
                     "mint({amount}) overflows i128 once converted to base units at {} \
-                     decimals; use mint_raw for amounts already in base units",
+                     decimals; use mint_raw for amounts already in base units: {err}",
                     self.decimals()
                 ))
             )
@@ -79,8 +130,32 @@ impl TestToken {
         self.mint_raw(to, raw);
     }
 
+    /// Attempt to mint `amount` **whole units** to `to`, returning
+    /// `Err(TestkitError)` if conversion overflows or if the mint traps.
+    ///
+    /// If the mint traps, `total_tracked` remains unchanged and consistent.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// let alice = env.address();
+    /// assert!(token.try_mint(&alice, 10).is_ok());
+    /// ```
+    pub fn try_mint(&self, to: &Address, amount: i128) -> Result<(), TestkitError> {
+        let raw = self.to_base_units(amount)?;
+        self.try_mint_raw(to, raw)
+    }
+
     /// Mint `amount` **base units** (stroops) to `to`, with no unit
     /// conversion.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError`] if the mint traps or fails.
     ///
     /// # Example
     ///
@@ -95,18 +170,74 @@ impl TestToken {
     /// token.assert_balance(&alice, 42);
     /// ```
     pub fn mint_raw(&self, to: &Address, amount: i128) {
-        StellarAssetClient::new(&self.env, &self.address)
-            .mock_auths(&[MockAuth {
-                address: &self.admin,
-                invoke: &MockAuthInvoke {
-                    contract: &self.address,
-                    fn_name: "mint",
-                    args: (to.clone(), amount).into_val(&self.env),
-                    sub_invokes: &[],
-                },
-            }])
-            .mint(to, &amount);
-        self.total_tracked.set(self.total_tracked.get() + amount);
+        if let Err(err) = self.try_mint_raw(to, amount) {
+            panic!("{err}");
+        }
+    }
+
+    /// Attempt to mint `amount` **base units** (stroops) to `to`.
+    ///
+    /// If the contract invocation traps or rejects the mint, `total_tracked`
+    /// remains consistent (unchanged) and a [`TestkitError`] is returned with
+    /// actionable context.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// let alice = env.address();
+    /// assert!(token.try_mint_raw(&alice, 42).is_ok());
+    /// ```
+    pub fn try_mint_raw(&self, to: &Address, amount: i128) -> Result<(), TestkitError> {
+        if amount < 0 {
+            return Err(TestkitError::Misuse(format!(
+                "cannot mint negative amount {amount} to {to:?}"
+            )));
+        }
+
+        let new_total = self
+            .total_tracked
+            .get()
+            .checked_add(amount)
+            .ok_or_else(|| {
+                TestkitError::Misuse(format!(
+                    "minting {amount} base units would overflow tracked supply (current total: {})",
+                    self.total_tracked.get()
+                ))
+            })?;
+
+        let invoke_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            StellarAssetClient::new(&self.env, &self.address)
+                .mock_auths(&[MockAuth {
+                    address: &self.admin,
+                    invoke: &MockAuthInvoke {
+                        contract: &self.address,
+                        fn_name: "mint",
+                        args: (to.clone(), amount).into_val(&self.env),
+                        sub_invokes: &[],
+                    },
+                }])
+                .try_mint(to, &amount)
+        }));
+
+        match invoke_res {
+            Ok(Ok(Ok(()))) => {
+                self.total_tracked.set(new_total);
+                Ok(())
+            }
+            Ok(Err(err)) => Err(TestkitError::AssertionFailed(format!(
+                "mint of {amount} base units to {to:?} failed or trapped: {err:?}"
+            ))),
+            Ok(Ok(Err(err))) => Err(TestkitError::DecodeFailed(format!(
+                "mint response decoding failed: {err:?}"
+            ))),
+            Err(_) => Err(TestkitError::AssertionFailed(format!(
+                "mint of {amount} base units to {to:?} trapped with panic"
+            ))),
+        }
     }
 
     /// The base-unit balance of `of`.
@@ -145,6 +276,52 @@ impl TestToken {
         }
     }
 
+    /// The whole-unit balance of `of` (truncated).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// let alice = env.address();
+    /// token.mint(&alice, 10);
+    /// assert_eq!(token.balance_whole(&alice), 10);
+    /// ```
+    pub fn balance_whole(&self, of: &Address) -> i128 {
+        let raw = self.balance(of);
+        self.to_whole_units(raw).unwrap_or_else(|err| {
+            panic!("{err}");
+        })
+    }
+
+    /// Assert that `of`'s whole-unit balance equals `expected_whole`.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::Misuse`] if scaling `expected_whole`
+    /// to base units overflows `i128`.
+    /// Panics with a [`TestkitError::AssertionFailed`] if balances differ.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// let alice = env.address();
+    /// token.mint(&alice, 10);
+    /// token.assert_balance_whole(&alice, 10);
+    /// ```
+    pub fn assert_balance_whole(&self, of: &Address, expected_whole: i128) {
+        let raw_expected = self.to_base_units(expected_whole).unwrap_or_else(|err| {
+            panic!("{err}");
+        });
+        self.assert_balance(of, raw_expected);
+    }
+
     /// Total base units minted through this `TestToken` (via
     /// [`TestToken::mint`] or [`TestToken::mint_raw`]) across every
     /// recipient — for supply-conservation assertions.
@@ -163,6 +340,53 @@ impl TestToken {
     pub fn total_tracked(&self) -> i128 {
         self.total_tracked.get()
     }
+}
+
+/// Convert a whole-unit amount into base units at the given decimal precision without overflowing.
+///
+/// Returns `Err(TestkitError::Misuse)` with actionable context if `10^decimals` or the
+/// multiplication overflows `i128`.
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::tokens::whole_to_base_units;
+///
+/// let raw = whole_to_base_units(10, 7).unwrap();
+/// assert_eq!(raw, 100_000_000);
+/// ```
+pub fn whole_to_base_units(whole: i128, decimals: u32) -> Result<i128, TestkitError> {
+    let scale = 10i128.checked_pow(decimals).ok_or_else(|| {
+        TestkitError::Misuse(format!(
+            "decimal precision {decimals} is too large: 10^{decimals} overflows i128"
+        ))
+    })?;
+    whole.checked_mul(scale).ok_or_else(|| {
+        TestkitError::Misuse(format!(
+            "converting {whole} whole units at {decimals} decimals overflows i128 (scale factor: {scale})"
+        ))
+    })
+}
+
+/// Convert a base-unit amount into whole units at the given decimal precision.
+///
+/// Returns `Err(TestkitError::Misuse)` with actionable context if `10^decimals` overflows `i128`.
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::tokens::base_to_whole_units;
+///
+/// let whole = base_to_whole_units(100_000_000, 7).unwrap();
+/// assert_eq!(whole, 10);
+/// ```
+pub fn base_to_whole_units(base: i128, decimals: u32) -> Result<i128, TestkitError> {
+    let scale = 10i128.checked_pow(decimals).ok_or_else(|| {
+        TestkitError::Misuse(format!(
+            "decimal precision {decimals} is too large: 10^{decimals} overflows i128"
+        ))
+    })?;
+    Ok(base / scale)
 }
 
 impl TestEnv {

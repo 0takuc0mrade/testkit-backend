@@ -145,15 +145,27 @@ impl EventLog {
     /// Render every captured event for inclusion in an assertion failure
     /// message.
     ///
-    /// Each line comes from `CapturedEvent::render`, so a diagnostic always
-    /// shows the decoded form of the exact raw values that were captured.
+    /// Each line decodes the raw captured topics and data (via
+    /// `decode_topic_diagnostic` / `decode_val_diagnostic`), so a diagnostic
+    /// always shows the decoded form of the exact raw values that were
+    /// captured.
     pub(crate) fn render(&self) -> String {
         if self.events.is_empty() {
             return "captured events: (none)".to_string();
         }
         let mut out = format!("captured events ({}):\n", self.events.len());
         for (i, event) in self.events.iter().enumerate() {
-            out.push_str(&format!("  [{i}] {}\n", event.render()));
+            let rendered_topics: Vec<String> = event
+                .topics
+                .iter()
+                .map(|t| crate::events::capture::decode_topic_diagnostic(&self.env, t))
+                .collect();
+            let rendered_data =
+                crate::events::capture::decode_val_diagnostic(&self.env, &event.data);
+            out.push_str(&format!(
+                "  [{i}] contract={:?} topics={:?} data={}\n",
+                event.contract, rendered_topics, rendered_data
+            ));
         }
         out
     }
@@ -268,16 +280,17 @@ mod tests {
         let log = env.events();
         let rendered = log.render();
         assert!(rendered.contains("Symbol(mint)"), "got: {rendered}");
-        assert!(rendered.contains("I128(555)"), "got: {rendered}");
+        assert!(rendered.contains("i128(555)"), "got: {rendered}");
 
-        // The log's diagnostic line is the rendered form of the raw event.
+        // The log's diagnostic line is the decoded form of the raw event.
         assert_eq!(log.events.len(), 1);
-        assert!(log.events[0].render().contains("Symbol(mint)"));
-        assert!(log.events[0].render().contains("I128(555)"));
+        let diag = log.diagnostics();
+        assert!(diag.contains("Symbol(mint)"), "got: {diag}");
+        assert!(diag.contains("i128(555)"), "got: {diag}");
     }
 
     #[test]
-    #[should_panic(expected = "I128(1)")]
+    #[should_panic(expected = "i128(1)")]
     fn assertion_failure_diagnostic_includes_the_decoded_captured_data() {
         let env = TestEnv::new();
         let id = env.env().register(Emitter, ());

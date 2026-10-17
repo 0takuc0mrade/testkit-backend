@@ -17,8 +17,19 @@ use super::CliError;
 pub struct AuditArgs {
     #[command(subcommand)]
     command: Option<AuditCommand>,
-    /// Path to the contract crate to audit (its `.rs` files are scanned
-    /// recursively), or `-` to scan Rust source from stdin.
+    /// Path to the contract crate to audit, or `-` to scan Rust source from
+    /// stdin.
+    ///
+    /// Supported scan roots:
+    /// - a directory: every `.rs` file beneath it is scanned recursively;
+    /// - a single `.rs` file;
+    /// - `-`: read Rust source from stdin.
+    ///
+    /// While scanning a directory these are excluded (skipped, never
+    /// descended into): `target/`, `node_modules/`, and any hidden directory
+    /// (its name begins with `.`, e.g. `.git/`, `.github/`, `.cargo/`). A
+    /// missing path is reported as an actionable error rather than an empty
+    /// "no findings" result.
     #[arg(value_name = "PATH", default_value = ".", global = true)]
     path: PathBuf,
     /// Exit non-zero if any findings are reported.
@@ -76,12 +87,12 @@ fn default_enabled() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct Finding {
-    file: PathBuf,
-    line: usize,
-    rule: &'static str,
-    severity: String,
-    message: String,
+pub struct Finding {
+    pub file: PathBuf,
+    pub line: usize,
+    pub rule: &'static str,
+    pub severity: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +125,17 @@ impl Finding {
 /// 5. Token transfer calls whose return value is explicitly or implicitly ignored.
 /// 6. Signed `amount` parameters with no comparison against zero.
 /// 7. Unchecked timestamp arithmetic operations that could overflow.
+///
+/// # Scan roots and exclusions
+///
+/// The supported scan roots are documented on `AuditArgs::path`: a
+/// directory is walked recursively for `.rs` files, a single `.rs` file is
+/// scanned directly, and `-` reads Rust source from stdin. Directory walks
+/// prune `target/`, `node_modules/`, and every hidden directory (a name
+/// beginning with `.`, such as `.git/` or `.github/`) via
+/// `collect_rust_sources`, so build output and vendored/tooling trees are
+/// never audited. A non-existent root returns an actionable error naming the
+/// supported inputs instead of silently reporting "no findings".
 pub fn run(args: AuditArgs) -> Result<(), CliError> {
     match &args.command {
         Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
@@ -138,14 +160,8 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
             &source,
         )?;
     } else {
-        for entry in WalkDir::new(&args.path).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            if entry.path().extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            audit_file(entry.path(), &mut findings, &config)?;
+        for path in collect_rust_sources(&args.path)? {
+            audit_file(&path, &mut findings, &config)?;
         }
     }
 
@@ -160,6 +176,68 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         )));
     }
     Ok(())
+}
+
+/// Directories excluded from a workspace scan regardless of where they
+/// appear. Hidden directories (names beginning with `.`) are excluded as
+/// well, by `is_scannable_entry`.
+///
+/// These are build output and dependency/tooling trees that either generated
+/// non-contract Rust or would just slow the scan down; the audit is meant to
+/// run on hand-written contract source.
+pub const AUDIT_EXCLUDED_DIRS: &[&str] = &["target", "node_modules"];
+
+/// Prunes excluded directories during a walk. Returns `true` for the user's
+/// chosen root (even if it happens to share a name with an excluded
+/// directory) and for every non-directory entry; returns `false` for
+/// excluded directories so [`WalkDir`] never descends into them.
+fn is_scannable_entry(entry: &walkdir::DirEntry) -> bool {
+    if !entry.file_type().is_dir() {
+        return true;
+    }
+    // Never prune the root the user explicitly asked us to scan.
+    if entry.depth() == 0 {
+        return true;
+    }
+    let file_name = entry.file_name();
+    let name = file_name.to_string_lossy();
+    let name: &str = &name;
+    !(name.starts_with('.') || AUDIT_EXCLUDED_DIRS.contains(&name))
+}
+
+/// Walks `root` and returns the `.rs` files that should be audited, applying
+/// the exclusions documented on `AuditArgs::path`.
+///
+/// A root that does not exist is an error, not an empty scan: silently
+/// reporting "no findings" for a typo'd path would be worse than useless in
+/// CI, so the message names every supported input form.
+fn collect_rust_sources(root: &Path) -> Result<Vec<PathBuf>, CliError> {
+    if !root.exists() {
+        return Err(CliError(format!(
+            "path {} does not exist; pass a contract crate directory, a single .rs file, \
+             or `-` to read Rust source from stdin",
+            root.display()
+        )));
+    }
+
+    let mut sources = Vec::new();
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(is_scannable_entry)
+    {
+        let entry = entry.map_err(|err| {
+            CliError(format!(
+                "failed to scan {}: {err}; check that the path is readable and re-run",
+                root.display()
+            ))
+        })?;
+        let is_rust = entry.path().extension().is_some_and(|ext| ext == "rs");
+        if entry.file_type().is_file() && is_rust {
+            sources.push(entry.path().to_path_buf());
+        }
+    }
+    Ok(sources)
 }
 
 fn explain_rule(rule: &str) -> Result<(), CliError> {
@@ -226,7 +304,7 @@ const RULES: &[(&str, &str, &str)] = &[
 fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     match format {
         AuditOutputFormat::Text => {
-            println!("{:<40} {:<10} {}", "RULE", "SEVERITY", "DESCRIPTION");
+            println!("{:<40} {:<10} DESCRIPTION", "RULE", "SEVERITY");
             println!("{}", "-".repeat(100));
             for (rule, severity, desc) in RULES {
                 println!("{rule:<40} {severity:<10} {desc}");
@@ -284,89 +362,137 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     }
 }
 
-fn render_findings(findings: &[Finding], format: AuditOutputFormat) -> Result<String, CliError> {
-    match format {
-        AuditOutputFormat::Text => Ok(render_text(findings)),
-        AuditOutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+/// Centralized diagnostic renderer across Text, JSON, and SARIF formats.
+pub struct DiagnosticRenderer<'a> {
+    findings: &'a [Finding],
+}
+
+impl<'a> DiagnosticRenderer<'a> {
+    /// Create a new diagnostic renderer for the given findings.
+    pub fn new(findings: &'a [Finding]) -> Self {
+        Self { findings }
+    }
+
+    /// Render diagnostics according to the specified output format.
+    pub fn render(&self, format: AuditOutputFormat) -> Result<String, CliError> {
+        match format {
+            AuditOutputFormat::Text => Ok(self.render_text()),
+            AuditOutputFormat::Json => self.render_json(),
+            AuditOutputFormat::Sarif => self.render_sarif(),
+        }
+    }
+
+    /// Render compiler-style human-readable text diagnostics.
+    pub fn render_text(&self) -> String {
+        if self.findings.is_empty() {
+            return "audit: no findings\n".to_string();
+        }
+
+        let mut output = String::new();
+        for finding in self.findings {
+            output.push_str(&format!(
+                "{}:{}: [{}] {}: {}\n",
+                finding.file.display(),
+                finding.line,
+                finding.severity,
+                finding.rule,
+                finding.message
+            ));
+        }
+        output.push_str(&format!(
+            "\n{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
+             security product — a missing finding is not a security guarantee.\n",
+            self.findings.len()
+        ));
+        output
+    }
+
+    /// Render stable, machine-readable JSON report.
+    pub fn render_json(&self) -> Result<String, CliError> {
+        serde_json::to_string_pretty(&serde_json::json!({
             "tool": "soroban-testkit",
             "version": 1,
-            "findings": findings,
-            "summary": { "finding_count": findings.len() }
+            "findings": self.findings,
+            "summary": { "finding_count": self.findings.len() }
         }))
         .map(|report| format!("{report}\n"))
-        .map_err(|err| CliError(format!("failed to serialize JSON audit report: {err}"))),
-        AuditOutputFormat::Sarif => render_sarif(findings),
+        .map_err(|err| CliError(format!("failed to serialize JSON audit report: {err}")))
+    }
+
+    /// Render SARIF 2.1.0 output for code scanning integration.
+    pub fn render_sarif(&self) -> Result<String, CliError> {
+        let mut rule_ids: Vec<_> = self.findings.iter().map(|finding| finding.rule).collect();
+        rule_ids.sort_unstable();
+        rule_ids.dedup();
+        let rules: Vec<_> = rule_ids
+            .into_iter()
+            .map(|rule| {
+                let description = RULES
+                    .iter()
+                    .find(|(id, _, _)| *id == rule)
+                    .map(|(_, _, desc)| *desc);
+                let mut rule_obj = serde_json::json!({
+                    "id": rule,
+                    "shortDescription": { "text": rule.replace('-', " ") }
+                });
+                if let Some(desc) = description {
+                    rule_obj["fullDescription"] = serde_json::json!({ "text": desc });
+                }
+                rule_obj
+            })
+            .collect();
+        let results: Vec<_> = self
+            .findings
+            .iter()
+            .map(|finding| {
+                let level = match finding.severity.as_str() {
+                    "error" => "error",
+                    "warning" => "warning",
+                    _ => "note",
+                };
+                serde_json::json!({
+                    "ruleId": finding.rule,
+                    "level": level,
+                    "message": { "text": finding.message },
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": { "uri": finding.file.to_string_lossy() },
+                            "region": { "startLine": finding.line.max(1) }
+                        }
+                    }]
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&serde_json::json!({
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+                "tool": { "driver": { "name": "soroban-testkit", "rules": rules } },
+                "results": results
+            }]
+        }))
+        .map(|report| format!("{report}\n"))
+        .map_err(|err| CliError(format!("failed to serialize SARIF audit report: {err}")))
     }
 }
 
-fn render_text(findings: &[Finding]) -> String {
-    if findings.is_empty() {
-        return "audit: no findings\n".to_string();
-    }
-
-    let mut output = String::new();
-    for finding in findings {
-        output.push_str(&format!(
-            "{}:{}: [{}] {}: {}\n",
-            finding.file.display(),
-            finding.line,
-            finding.severity,
-            finding.rule,
-            finding.message
-        ));
-    }
-    output.push_str(&format!(
-        "\n{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
-         security product — a missing finding is not a security guarantee.\n",
-        findings.len()
-    ));
-    output
+pub fn render_findings(
+    findings: &[Finding],
+    format: AuditOutputFormat,
+) -> Result<String, CliError> {
+    DiagnosticRenderer::new(findings).render(format)
 }
 
-fn render_sarif(findings: &[Finding]) -> Result<String, CliError> {
-    let mut rule_ids: Vec<_> = findings.iter().map(|finding| finding.rule).collect();
-    rule_ids.sort_unstable();
-    rule_ids.dedup();
-    let rules: Vec<_> = rule_ids
-        .into_iter()
-        .map(|rule| {
-            serde_json::json!({
-                "id": rule,
-                "shortDescription": { "text": rule.replace('-', " ") }
-            })
-        })
-        .collect();
-    let results: Vec<_> = findings
-        .iter()
-        .map(|finding| {
-            let level = match finding.severity.as_str() {
-                "error" => "error",
-                "warning" => "warning",
-                _ => "note",
-            };
-            serde_json::json!({
-                "ruleId": finding.rule,
-                "level": level,
-                "message": { "text": finding.message },
-                "locations": [{
-                    "physicalLocation": {
-                        "artifactLocation": { "uri": finding.file.to_string_lossy() },
-                        "region": { "startLine": finding.line.max(1) }
-                    }
-                }]
-            })
-        })
-        .collect();
-    serde_json::to_string_pretty(&serde_json::json!({
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [{
-            "tool": { "driver": { "name": "soroban-testkit", "rules": rules } },
-            "results": results
-        }]
-    }))
-    .map(|report| format!("{report}\n"))
-    .map_err(|err| CliError(format!("failed to serialize SARIF audit report: {err}")))
+pub fn render_text(findings: &[Finding]) -> String {
+    DiagnosticRenderer::new(findings).render_text()
+}
+
+pub fn render_json(findings: &[Finding]) -> Result<String, CliError> {
+    DiagnosticRenderer::new(findings).render_json()
+}
+
+pub fn render_sarif(findings: &[Finding]) -> Result<String, CliError> {
+    DiagnosticRenderer::new(findings).render_sarif()
 }
 
 fn load_config(root: &Path) -> Result<AuditConfig, CliError> {
@@ -425,7 +551,6 @@ fn audit_source(
 
     let suppressions = extract_suppressions(full_src);
 
-    let suppressions = Vec::new();
     let mut visitor = FunctionVisitor {
         path: path.to_path_buf(),
         findings,
@@ -439,6 +564,7 @@ fn audit_source(
 struct Suppression {
     line: usize,
     rules: Vec<String>,
+    #[allow(dead_code)]
     reason: Option<String>,
 }
 
@@ -454,8 +580,8 @@ fn extract_suppressions(src: &str) -> Vec<Suppression> {
 
                     for part in content.split(',') {
                         let part = part.trim();
-                        if part.starts_with("reason=") {
-                            reason = Some(part[7..].trim_matches('"').to_string());
+                        if let Some(stripped) = part.strip_prefix("reason=") {
+                            reason = Some(stripped.trim_matches('"').to_string());
                         } else if !part.is_empty() && part != "skip" {
                             rules.push(part.to_string());
                         }
@@ -633,12 +759,11 @@ impl FunctionVisitor<'_> {
 
         // Check if this finding is suppressed
         for suppression in self.suppressions {
-            if (suppression.line == line || suppression.line == line - 1) {
-                if suppression.rules.contains(&"*".to_string())
-                    || suppression.rules.iter().any(|r| r == rule)
-                {
-                    return;
-                }
+            if (suppression.line == line || suppression.line == line - 1)
+                && (suppression.rules.contains(&"*".to_string())
+                    || suppression.rules.iter().any(|r| r == rule))
+            {
+                return;
             }
         }
 
@@ -1059,12 +1184,10 @@ mod tests {
 
         let file = syn::parse_file(code).unwrap();
         let suppressions = Vec::new();
-        let suppressions = Vec::new();
         let mut visitor = FunctionVisitor {
             path: PathBuf::from("test.rs"),
             findings: &mut findings,
             config: &config,
-            suppressions: &suppressions,
             suppressions: &suppressions,
         };
         visitor.visit_file(&file);
@@ -1315,5 +1438,48 @@ mod tests {
                 ["uri"],
             "<test>"
         );
+    }
+
+    // ---- #489: documented scan roots and exclusions ----
+
+    #[test]
+    fn collect_rust_sources_excludes_build_vendor_and_hidden_directories() {
+        let root = std::env::temp_dir().join(format!("stk-audit-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn a() {}").unwrap();
+        std::fs::write(root.join("target/debug/generated.rs"), "pub fn b() {}").unwrap();
+        std::fs::write(root.join("node_modules/pkg/dep.rs"), "pub fn c() {}").unwrap();
+        std::fs::write(root.join(".git/objects/blob.rs"), "pub fn d() {}").unwrap();
+
+        let sources = collect_rust_sources(&root).unwrap();
+        assert_eq!(sources, vec![root.join("src/lib.rs")]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_rust_sources_accepts_a_single_file_root() {
+        let root = std::env::temp_dir().join(format!("stk-audit-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("only.rs");
+        std::fs::write(&file, "pub fn a() {}").unwrap();
+
+        let sources = collect_rust_sources(&file).unwrap();
+        assert_eq!(sources, vec![file]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_rust_sources_reports_a_missing_root_actionably() {
+        let missing = std::env::temp_dir().join("stk-audit-root-that-does-not-exist-anywhere");
+        let err = collect_rust_sources(&missing).unwrap_err();
+        assert!(err.0.contains("does not exist"), "{}", err.0);
+        assert!(err.0.contains("stdin"), "{}", err.0);
     }
 }

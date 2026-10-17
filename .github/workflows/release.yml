@@ -41,15 +41,9 @@ jobs:
           fi
           echo "version=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Workspace version matches the tag
+      - name: Workspace and crate versions match the tag
         run: |
-          workspace="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          expected="${{ steps.resolve.outputs.version }}"
-          if [ "$workspace" != "$expected" ]; then
-            echo "Tag requests $expected but [workspace.package] version is $workspace."
-            echo "Bump Cargo.toml and move the CHANGELOG [Unreleased] entry into a dated section, in one commit."
-            exit 1
-          fi
+          bash .github/scripts/verify-release.sh "${{ steps.resolve.outputs.version }}"
 
       - name: CHANGELOG has a section for this version
         run: |

@@ -282,6 +282,100 @@ impl TestkitError {
         }
     }
 
+    /// Attach an operation description to this error's context.
+    ///
+    /// Preserves the underlying error as the standard source while formatting
+    /// the operation details clearly.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestkitError;
+    ///
+    /// let err = TestkitError::AssertionFailed("balance mismatch".into())
+    ///     .with_operation("deposit");
+    /// assert_eq!(
+    ///     err.to_string(),
+    ///     "operation 'deposit': assertion failed: balance mismatch"
+    /// );
+    /// assert_eq!(err.code(), "TESTKIT_ASSERTION_FAILED");
+    /// ```
+    pub fn with_operation(self, operation: impl Into<String>) -> Self {
+        self.with_context(format!("operation '{}'", operation.into()))
+    }
+
+    /// Attach contract details to this error's context.
+    ///
+    /// Preserves the underlying error as the standard source while formatting
+    /// the contract identifier or address clearly.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestkitError;
+    ///
+    /// let err = TestkitError::AssertionFailed("unauthorized caller".into())
+    ///     .with_contract("CA3D...1234");
+    /// assert_eq!(
+    ///     err.to_string(),
+    ///     "contract 'CA3D...1234': assertion failed: unauthorized caller"
+    /// );
+    /// assert_eq!(err.code(), "TESTKIT_ASSERTION_FAILED");
+    /// ```
+    pub fn with_contract(self, contract: impl Into<String>) -> Self {
+        self.with_context(format!("contract '{}'", contract.into()))
+    }
+
+    /// Attach both operation and contract details to this error's context.
+    ///
+    /// Preserves the underlying error as the standard source while combining
+    /// the operation name and target contract in a human-readable format.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestkitError;
+    ///
+    /// let err = TestkitError::AssertionFailed("transfer reverted".into())
+    ///     .with_operation_and_contract("transfer", "CA3D...1234");
+    /// assert_eq!(
+    ///     err.to_string(),
+    ///     "operation 'transfer' on contract 'CA3D...1234': assertion failed: transfer reverted"
+    /// );
+    /// assert_eq!(err.code(), "TESTKIT_ASSERTION_FAILED");
+    /// ```
+    pub fn with_operation_and_contract(
+        self,
+        operation: impl Into<String>,
+        contract: impl Into<String>,
+    ) -> Self {
+        self.with_context(format!(
+            "operation '{}' on contract '{}'",
+            operation.into(),
+            contract.into()
+        ))
+    }
+
+    /// Return the high-level context message if this error is wrapped in a [`TestkitError::Context`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestkitError;
+    ///
+    /// let err = TestkitError::Misuse("events were never captured".into());
+    /// assert_eq!(err.context(), None);
+    ///
+    /// let with_op = err.with_operation("capture_events");
+    /// assert_eq!(with_op.context(), Some("operation 'capture_events'"));
+    /// ```
+    pub fn context(&self) -> Option<&str> {
+        match self {
+            Self::Context { context, .. } => Some(context.as_str()),
+            _ => None,
+        }
+    }
+
     /// The variant name of this error, as a static string.
     ///
     /// # Example

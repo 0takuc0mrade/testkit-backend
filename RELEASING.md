@@ -91,7 +91,7 @@ gh release create v<version> --title "v<version>" --notes-file <(sed -n '/^## \[
 
 The `Release` workflow enforces these release-critical invariants:
 
-- The git tag (`v<version>`) matches `[workspace.package] version`.
+- The git tag (`v<version>`) matches `[workspace.package] version` and both published crate versions (`crates/testkit` and `crates/cli`), verified by `.github/scripts/verify-release.sh`.
 - `CHANGELOG.md` has a section for `<version>` (so a release can never ship
   without release notes).
 - `COMPATIBILITY.md` documents the pinned `soroban-sdk` version.

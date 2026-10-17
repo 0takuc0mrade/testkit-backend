@@ -92,6 +92,12 @@ section, so a merge can never land without a place to record the change.
 
 ### Fixed
 
+- `TestEnv::at` now enters its scope with a coherent ledger position: the
+  sequence number is derived from the scoped timestamp and the environment's
+  ledger close interval (saturating at the ends of the range) instead of
+  leaving the newer pre-scope sequence in place. The complete pre-scope
+  snapshot is still restored on exit, so the newer clock comes back intact
+  and nothing the scope touched leaks out.
 - `coverage` command now provides a specific, actionable error message when
   `cargo-llvm-cov` is not installed or not found in PATH, distinguishing
   between the tool being missing and other subprocess errors.

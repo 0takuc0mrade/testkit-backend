@@ -444,14 +444,104 @@ impl TestEnv {
     /// assert!(ttl > 0);
     /// # }
     /// ```
+    /// Attempt to inspect the TTL of a storage entry, returning `Ok(ttl)`
+    /// or a [`TestkitError`].
+    ///
+    /// Distinguishes between:
+    /// - **Missing key** ([`TestkitError::AssertionFailed`]): The contract exists and storage can be inspected, but the key is absent.
+    /// - **Unsupported storage inspection** ([`TestkitError::Misuse`]): The target cannot be inspected (e.g. invalid or unregistered contract address).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::ttl::StorageKind;
+    /// use soroban_sdk::symbol_short;
+    ///
+    /// let env = TestEnv::new();
+    /// let unregistered = env.address();
+    /// let res = env.try_ttl_of(&unregistered, StorageKind::Persistent, symbol_short!("k"));
+    /// assert!(res.is_err());
+    /// ```
+    pub fn try_ttl_of<K: IntoVal<Env, Val>>(
+        &self,
+        contract: &Address,
+        kind: StorageKind,
+        key: K,
+    ) -> Result<u32, TestkitError> {
+        let key_val = key.into_val(self.env());
+        self.try_ttl_of_val(contract, kind, &key_val)
+    }
+
+    /// Returns the current TTL of a storage entry in ledgers.
+    ///
+    /// Panics if the entry does not exist, or — for
+    /// [`StorageKind::Persistent`] and [`StorageKind::Temporary`] — has
+    /// already expired. This matches `soroban_sdk::testutils`' own
+    /// `get_ttl` methods, which this is built on.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::ttl::StorageKind;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Store;
+    ///
+    /// #[contractimpl]
+    /// impl Store {
+    ///     pub fn set(env: Env, key: Symbol, value: i128) {
+    ///         env.storage().persistent().set(&key, &value);
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Store, ());
+    /// StoreClient::new(env.env(), &id).set(&symbol_short!("k"), &1);
+    ///
+    /// let ttl = env.ttl_of(&id, StorageKind::Persistent, symbol_short!("k"));
+    /// assert!(ttl > 0);
+    /// # }
+    /// ```
     pub fn ttl_of<K: IntoVal<Env, Val>>(
         &self,
         contract: &Address,
         kind: StorageKind,
         key: K,
     ) -> u32 {
-        let key_val = key.into_val(self.env());
-        self.ttl_of_val(contract, kind, &key_val)
+        self.try_ttl_of(contract, kind, key).unwrap_or_else(|err| {
+            panic!("{err}");
+        })
+    }
+
+    /// Run `f` in a scoped expiry simulation for the given `kind`, restoring
+    /// the original ledger settings and clock position after `f` completes or panics.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::ttl::StorageKind;
+    ///
+    /// let env = TestEnv::new();
+    /// let seq_before = env.sequence();
+    /// env.simulate_expiry(StorageKind::Persistent, || {
+    ///     assert!(env.sequence() > seq_before);
+    /// });
+    /// assert_eq!(env.sequence(), seq_before);
+    /// ```
+    pub fn simulate_expiry<T>(&self, kind: StorageKind, f: impl FnOnce() -> T) -> T {
+        let checkpoint = self.checkpoint();
+        self.expire(kind);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        self.restore_checkpoint(checkpoint);
+        match res {
+            Ok(val) => val,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// Advance the ledger far enough that every entry — regardless of
@@ -468,6 +558,10 @@ impl TestEnv {
     /// same reasoning applied to ledger close time) and advances one
     /// ledger past it, which guarantees expiry for every kind at once.
     ///
+    /// Preserves unrelated ledger settings (`protocol_version`, `base_reserve`,
+    /// `network_id`, `min_temp_entry_ttl`, `min_persistent_entry_ttl`,
+    /// `max_entry_ttl`).
+    ///
     /// # Example
     ///
     /// ```
@@ -479,8 +573,28 @@ impl TestEnv {
     /// ```
     pub fn expire(&self, kind: StorageKind) {
         let _ = kind;
-        let max_entry_ttl = self.env().ledger().get().max_entry_ttl;
+        let ledger = self.env().ledger().get();
+        let max_entry_ttl = ledger.max_entry_ttl;
         self.advance_ledgers(max_entry_ttl.saturating_add(1));
+        let current = self.env().ledger().get();
+        if current.protocol_version != ledger.protocol_version
+            || current.base_reserve != ledger.base_reserve
+            || current.network_id != ledger.network_id
+            || current.min_temp_entry_ttl != ledger.min_temp_entry_ttl
+            || current.min_persistent_entry_ttl != ledger.min_persistent_entry_ttl
+            || current.max_entry_ttl != ledger.max_entry_ttl
+        {
+            self.env().ledger().set(soroban_sdk::testutils::LedgerInfo {
+                sequence_number: current.sequence_number,
+                timestamp: current.timestamp,
+                protocol_version: ledger.protocol_version,
+                base_reserve: ledger.base_reserve,
+                network_id: ledger.network_id,
+                min_temp_entry_ttl: ledger.min_temp_entry_ttl,
+                min_persistent_entry_ttl: ledger.min_persistent_entry_ttl,
+                max_entry_ttl: ledger.max_entry_ttl,
+            });
+        }
     }
 
     /// Assert that running `f` extends the TTL of the entry at `contract`/
@@ -1490,12 +1604,50 @@ impl TestEnv {
         }
     }
 
+    fn try_ttl_of_val(
+        &self,
+        contract: &Address,
+        kind: StorageKind,
+        key_val: &Val,
+    ) -> Result<u32, TestkitError> {
+        let inspection_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.env().as_contract(contract, || match kind {
+                StorageKind::Temporary => {
+                    let has_key = self.env().storage().temporary().has(key_val);
+                    if !has_key {
+                        return Err(TestkitError::AssertionFailed(format!(
+                            "missing key: entry {key_val:?} does not exist in Temporary storage for contract {contract:?}"
+                        )));
+                    }
+                    Ok(self.env().storage().temporary().get_ttl(key_val))
+                }
+                StorageKind::Persistent => {
+                    let has_key = self.env().storage().persistent().has(key_val);
+                    if !has_key {
+                        return Err(TestkitError::AssertionFailed(format!(
+                            "missing key: entry {key_val:?} does not exist in Persistent storage for contract {contract:?}"
+                        )));
+                    }
+                    Ok(self.env().storage().persistent().get_ttl(key_val))
+                }
+                StorageKind::Instance => Ok(self.env().storage().instance().get_ttl()),
+            })
+        }));
+
+        match inspection_res {
+            Ok(inner_res) => inner_res,
+            Err(payload) => Err(TestkitError::Misuse(format!(
+                "unsupported storage inspection: cannot inspect storage for contract {contract:?} (contract may not be registered or address is not a contract): {}",
+                panic_message(&payload)
+            ))),
+        }
+    }
+
     fn ttl_of_val(&self, contract: &Address, kind: StorageKind, key_val: &Val) -> u32 {
-        self.env().as_contract(contract, || match kind {
-            StorageKind::Temporary => self.env().storage().temporary().get_ttl(key_val),
-            StorageKind::Persistent => self.env().storage().persistent().get_ttl(key_val),
-            StorageKind::Instance => self.env().storage().instance().get_ttl(),
-        })
+        self.try_ttl_of_val(contract, kind, key_val)
+            .unwrap_or_else(|err| {
+                panic!("{err}");
+            })
     }
 }
 
