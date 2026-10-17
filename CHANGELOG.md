@@ -89,6 +89,15 @@ section, so a merge can never land without a place to record the change.
 - The `limits` subcommand now mocks authorization on each isolated probe
   and defaults numeric ramp parameters to a non-zero value, making it
   usable against real auth-gated payout contracts out of the box.
+- `AuthMatrix` docs now state that repeated callers are de-duplicated and
+  that entry-point names may be reused to check one function under several
+  setups, each producing its own reported section.
+- `soroban_testkit::tokens` docs now name the unit (whole units vs base
+  units/stroops) on every method and state that the SAC admin's authorization
+  is mocked for `mint`/`mint_raw` only, not for other operations.
+- `soroban_testkit::ttl` docs now spell out per-storage-kind behavior against
+  the pinned SDK: temporary entries are deleted on expiry, while persistent
+  and instance entries are archived and restored on next read.
 
 ### Fixed
 
