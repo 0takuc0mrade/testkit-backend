@@ -150,9 +150,16 @@ impl EventLog {
         }
         let mut out = format!("captured events ({}):\n", self.events.len());
         for (i, event) in self.events.iter().enumerate() {
+            let rendered_topics: Vec<String> = event
+                .topics
+                .iter()
+                .map(|t| crate::events::capture::decode_topic_diagnostic(&self.env, t))
+                .collect();
+            let rendered_data =
+                crate::events::capture::decode_val_diagnostic(&self.env, &event.data);
             out.push_str(&format!(
-                "  [{i}] contract={:?} topics={:?} data={:?}\n",
-                event.contract, event.topics, event.data
+                "  [{i}] contract={:?} topics={:?} data={}\n",
+                event.contract, rendered_topics, rendered_data
             ));
         }
         out

@@ -1,7 +1,7 @@
 use soroban_sdk::testutils::Events as _;
 use soroban_sdk::{xdr, Address, Env, IntoVal, TryFromVal, Val};
 
-use crate::core::TestEnv;
+use crate::core::{TestEnv, TestkitError};
 
 /// A single contract event, decoded into ergonomic SDK types.
 #[derive(Debug, Clone)]
@@ -12,6 +12,50 @@ pub struct CapturedEvent {
     pub topics: Vec<Val>,
     /// The event's data payload.
     pub data: Val,
+}
+
+impl CapturedEvent {
+    /// Attempt to decode the topic at `index` into type `T`.
+    ///
+    /// Returns `Err(TestkitError::Misuse)` if `index` is out of bounds,
+    /// or `Err(TestkitError::DecodeFailed)` with actionable diagnostic context
+    /// if decoding fails, without panicking.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_sdk::Symbol;
+    ///
+    /// let env = TestEnv::new();
+    /// assert!(env.events().is_empty());
+    /// ```
+    pub fn decode_topic<T: TryFromVal<Env, Val>>(
+        &self,
+        env: &Env,
+        index: usize,
+    ) -> Result<T, TestkitError> {
+        let topic = self.topics.get(index).ok_or_else(|| {
+            TestkitError::Misuse(format!(
+                "topic index {index} out of bounds: event has {} topic(s)",
+                self.topics.len()
+            ))
+        })?;
+        T::try_from_val(env, topic).map_err(|_| {
+            let diag = decode_topic_diagnostic(env, topic);
+            TestkitError::DecodeFailed(format!(
+                "failed to decode topic at index {index} as requested type; topic value: {diag}"
+            ))
+        })
+    }
+
+    /// Render all topics as human-readable diagnostic strings without panicking.
+    pub fn diagnostic_topics(&self, env: &Env) -> Vec<String> {
+        self.topics
+            .iter()
+            .map(|t| decode_topic_diagnostic(env, t))
+            .collect()
+    }
 }
 
 /// A filterable, assertable log of captured contract events.
@@ -35,6 +79,25 @@ pub struct EventLog {
 }
 
 impl EventLog {
+    /// Create an `EventLog` directly from an environment and captured events.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::events::EventLog;
+    ///
+    /// let env = TestEnv::new();
+    /// let log = EventLog::from_events(env.env(), vec![]);
+    /// assert!(log.is_empty());
+    /// ```
+    pub fn from_events(env: &Env, events: Vec<CapturedEvent>) -> Self {
+        Self {
+            env: env.clone(),
+            events,
+        }
+    }
+
     pub(crate) fn capture(env: &Env) -> Self {
         let raw = env.events().all();
         let events = raw
@@ -123,6 +186,103 @@ impl EventLog {
                 .collect(),
         }
     }
+
+    /// Return the diagnostic rendering of all captured events in this log.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let log = env.events();
+    /// assert_eq!(log.diagnostics(), "captured events: (none)");
+    /// ```
+    pub fn diagnostics(&self) -> String {
+        self.render()
+    }
+}
+
+/// Decode a topic `Val` into a human-readable diagnostic string without panicking.
+///
+/// If the topic is a recognized type (Symbol, Address, integers, bool, string, etc.),
+/// it is formatted with its type tag. If decoding fails or the topic value is an
+/// unknown or arbitrary `Val`, returns a safe diagnostic fallback `<unknown topic: ...>`
+/// without panicking.
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::core::TestEnv;
+/// use soroban_testkit::events::decode_topic_diagnostic;
+/// use soroban_sdk::{symbol_short, IntoVal};
+///
+/// let env = TestEnv::new();
+/// let val = symbol_short!("test").into_val(env.env());
+/// let rendered = decode_topic_diagnostic(env.env(), &val);
+/// assert!(rendered.contains("test"));
+/// ```
+pub fn decode_topic_diagnostic(env: &Env, val: &Val) -> String {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(sym) = soroban_sdk::Symbol::try_from_val(env, val) {
+            return format!("Symbol({sym:?})");
+        }
+        if let Ok(addr) = soroban_sdk::Address::try_from_val(env, val) {
+            return format!("Address({addr:?})");
+        }
+        if let Ok(num) = i128::try_from_val(env, val) {
+            return format!("i128({num})");
+        }
+        if let Ok(num) = u64::try_from_val(env, val) {
+            return format!("u64({num})");
+        }
+        if let Ok(num) = u32::try_from_val(env, val) {
+            return format!("u32({num})");
+        }
+        if let Ok(num) = i32::try_from_val(env, val) {
+            return format!("i32({num})");
+        }
+        if let Ok(b) = bool::try_from_val(env, val) {
+            return format!("bool({b})");
+        }
+        if let Ok(sc_val) = xdr::ScVal::try_from_val(env, val) {
+            return format!("{sc_val:?}");
+        }
+        format!("<unknown topic: {val:?}>")
+    }));
+
+    res.unwrap_or_else(|_| format!("<unknown topic: unparseable {val:?}>"))
+}
+
+/// Decode an event data payload `Val` into a diagnostic string without panicking.
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::core::TestEnv;
+/// use soroban_testkit::events::decode_val_diagnostic;
+/// use soroban_sdk::IntoVal;
+///
+/// let env = TestEnv::new();
+/// let val = 42_i128.into_val(env.env());
+/// let rendered = decode_val_diagnostic(env.env(), &val);
+/// assert!(rendered.contains("42"));
+/// ```
+pub fn decode_val_diagnostic(env: &Env, val: &Val) -> String {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(sym) = soroban_sdk::Symbol::try_from_val(env, val) {
+            return format!("Symbol({sym:?})");
+        }
+        if let Ok(num) = i128::try_from_val(env, val) {
+            return format!("i128({num})");
+        }
+        if let Ok(sc_val) = xdr::ScVal::try_from_val(env, val) {
+            return format!("{sc_val:?}");
+        }
+        format!("<unknown data: {val:?}>")
+    }));
+
+    res.unwrap_or_else(|_| format!("<unknown data: unparseable {val:?}>"))
 }
 
 /// Compares two `Val`s for structural equality by round-tripping both

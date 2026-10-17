@@ -114,9 +114,20 @@ the first failing ramp value with binary search.
 Every ramp attempt runs in its own subprocess: a real `.wasm` contract
 that exceeds resource limits can abort the process outright rather than
 return an error, and isolating each attempt is the only safe way to probe
-past that boundary. Ledger read/write counts and transaction size aren't
-reported (they come from a network-side simulated footprint this crate
-doesn't produce); instructions and memory, measured locally, are.
+past that boundary. Failed probes are classified with a stable category
+(`exit-failure`, `timed-out`, `abort`, or `spawn-failure`), and the same
+summary renders both the terminal output and the `--export` JSON, so the
+two formats cannot disagree about the discovered boundary. Ledger
+read/write counts and transaction size aren't reported (they come from a
+network-side simulated footprint this crate doesn't produce); instructions
+and memory, measured locally, are.
+
+`audit` accepts three scan roots: a crate directory (walked recursively for
+`.rs` files), a single `.rs` file, or `-` to read Rust source from stdin.
+While walking a directory it skips `target/`, `node_modules/`, and hidden
+directories such as `.git/` and `.github/`, so build output and vendored or
+tooling code is never reported. A path that doesn't exist is an actionable
+error rather than an empty "no findings" run.
 
 ## Status
 
