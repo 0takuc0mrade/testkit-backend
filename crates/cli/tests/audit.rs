@@ -260,7 +260,6 @@ fn audit_formats_handle_clean_crate_consistently() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-
 #[test]
 fn audit_reports_macro_generated_source_caveat_in_all_formats() {
     let source = br#"
