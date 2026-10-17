@@ -96,6 +96,11 @@ fn audit_scans_macro_entry_points_from_stdin() {
 #[test]
 fn limits_finds_the_real_mainnet_write_ceiling_for_batch_payout() {
     let build = Command::new("cargo")
+        // The outer cargo-llvm-cov run instruments native tests. This nested
+        // WASM fixture build must not inherit its unsupported coverage flags.
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_TARGET_WASM32V1_NONE_RUSTFLAGS")
         .args([
             "build",
             "-p",
