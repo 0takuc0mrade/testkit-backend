@@ -87,12 +87,12 @@ fn default_enabled() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct Finding {
-    file: PathBuf,
-    line: usize,
-    rule: &'static str,
-    severity: String,
-    message: String,
+pub struct Finding {
+    pub file: PathBuf,
+    pub line: usize,
+    pub rule: &'static str,
+    pub severity: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -362,89 +362,133 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     }
 }
 
-fn render_findings(findings: &[Finding], format: AuditOutputFormat) -> Result<String, CliError> {
-    match format {
-        AuditOutputFormat::Text => Ok(render_text(findings)),
-        AuditOutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+/// Centralized diagnostic renderer across Text, JSON, and SARIF formats.
+pub struct DiagnosticRenderer<'a> {
+    findings: &'a [Finding],
+}
+
+impl<'a> DiagnosticRenderer<'a> {
+    /// Create a new diagnostic renderer for the given findings.
+    pub fn new(findings: &'a [Finding]) -> Self {
+        Self { findings }
+    }
+
+    /// Render diagnostics according to the specified output format.
+    pub fn render(&self, format: AuditOutputFormat) -> Result<String, CliError> {
+        match format {
+            AuditOutputFormat::Text => Ok(self.render_text()),
+            AuditOutputFormat::Json => self.render_json(),
+            AuditOutputFormat::Sarif => self.render_sarif(),
+        }
+    }
+
+    /// Render compiler-style human-readable text diagnostics.
+    pub fn render_text(&self) -> String {
+        if self.findings.is_empty() {
+            return "audit: no findings\n".to_string();
+        }
+
+        let mut output = String::new();
+        for finding in self.findings {
+            output.push_str(&format!(
+                "{}:{}: [{}] {}: {}\n",
+                finding.file.display(),
+                finding.line,
+                finding.severity,
+                finding.rule,
+                finding.message
+            ));
+        }
+        output.push_str(&format!(
+            "\n{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
+             security product — a missing finding is not a security guarantee.\n",
+            self.findings.len()
+        ));
+        output
+    }
+
+    /// Render stable, machine-readable JSON report.
+    pub fn render_json(&self) -> Result<String, CliError> {
+        serde_json::to_string_pretty(&serde_json::json!({
             "tool": "soroban-testkit",
             "version": 1,
-            "findings": findings,
-            "summary": { "finding_count": findings.len() }
+            "findings": self.findings,
+            "summary": { "finding_count": self.findings.len() }
         }))
         .map(|report| format!("{report}\n"))
-        .map_err(|err| CliError(format!("failed to serialize JSON audit report: {err}"))),
-        AuditOutputFormat::Sarif => render_sarif(findings),
+        .map_err(|err| CliError(format!("failed to serialize JSON audit report: {err}")))
+    }
+
+    /// Render SARIF 2.1.0 output for code scanning integration.
+    pub fn render_sarif(&self) -> Result<String, CliError> {
+        let mut rule_ids: Vec<_> = self.findings.iter().map(|finding| finding.rule).collect();
+        rule_ids.sort_unstable();
+        rule_ids.dedup();
+        let rules: Vec<_> = rule_ids
+            .into_iter()
+            .map(|rule| {
+                let description = RULES
+                    .iter()
+                    .find(|(id, _, _)| *id == rule)
+                    .map(|(_, _, desc)| *desc);
+                let mut rule_obj = serde_json::json!({
+                    "id": rule,
+                    "shortDescription": { "text": rule.replace('-', " ") }
+                });
+                if let Some(desc) = description {
+                    rule_obj["fullDescription"] = serde_json::json!({ "text": desc });
+                }
+                rule_obj
+            })
+            .collect();
+        let results: Vec<_> = self.findings
+            .iter()
+            .map(|finding| {
+                let level = match finding.severity.as_str() {
+                    "error" => "error",
+                    "warning" => "warning",
+                    _ => "note",
+                };
+                serde_json::json!({
+                    "ruleId": finding.rule,
+                    "level": level,
+                    "message": { "text": finding.message },
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": { "uri": finding.file.to_string_lossy() },
+                            "region": { "startLine": finding.line.max(1) }
+                        }
+                    }]
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&serde_json::json!({
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+                "tool": { "driver": { "name": "soroban-testkit", "rules": rules } },
+                "results": results
+            }]
+        }))
+        .map(|report| format!("{report}\n"))
+        .map_err(|err| CliError(format!("failed to serialize SARIF audit report: {err}")))
     }
 }
 
-fn render_text(findings: &[Finding]) -> String {
-    if findings.is_empty() {
-        return "audit: no findings\n".to_string();
-    }
-
-    let mut output = String::new();
-    for finding in findings {
-        output.push_str(&format!(
-            "{}:{}: [{}] {}: {}\n",
-            finding.file.display(),
-            finding.line,
-            finding.severity,
-            finding.rule,
-            finding.message
-        ));
-    }
-    output.push_str(&format!(
-        "\n{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
-         security product — a missing finding is not a security guarantee.\n",
-        findings.len()
-    ));
-    output
+pub fn render_findings(findings: &[Finding], format: AuditOutputFormat) -> Result<String, CliError> {
+    DiagnosticRenderer::new(findings).render(format)
 }
 
-fn render_sarif(findings: &[Finding]) -> Result<String, CliError> {
-    let mut rule_ids: Vec<_> = findings.iter().map(|finding| finding.rule).collect();
-    rule_ids.sort_unstable();
-    rule_ids.dedup();
-    let rules: Vec<_> = rule_ids
-        .into_iter()
-        .map(|rule| {
-            serde_json::json!({
-                "id": rule,
-                "shortDescription": { "text": rule.replace('-', " ") }
-            })
-        })
-        .collect();
-    let results: Vec<_> = findings
-        .iter()
-        .map(|finding| {
-            let level = match finding.severity.as_str() {
-                "error" => "error",
-                "warning" => "warning",
-                _ => "note",
-            };
-            serde_json::json!({
-                "ruleId": finding.rule,
-                "level": level,
-                "message": { "text": finding.message },
-                "locations": [{
-                    "physicalLocation": {
-                        "artifactLocation": { "uri": finding.file.to_string_lossy() },
-                        "region": { "startLine": finding.line.max(1) }
-                    }
-                }]
-            })
-        })
-        .collect();
-    serde_json::to_string_pretty(&serde_json::json!({
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [{
-            "tool": { "driver": { "name": "soroban-testkit", "rules": rules } },
-            "results": results
-        }]
-    }))
-    .map(|report| format!("{report}\n"))
-    .map_err(|err| CliError(format!("failed to serialize SARIF audit report: {err}")))
+pub fn render_text(findings: &[Finding]) -> String {
+    DiagnosticRenderer::new(findings).render_text()
+}
+
+pub fn render_json(findings: &[Finding]) -> Result<String, CliError> {
+    DiagnosticRenderer::new(findings).render_json()
+}
+
+pub fn render_sarif(findings: &[Finding]) -> Result<String, CliError> {
+    DiagnosticRenderer::new(findings).render_sarif()
 }
 
 fn load_config(root: &Path) -> Result<AuditConfig, CliError> {
