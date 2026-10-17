@@ -271,7 +271,7 @@ fn limits_export_json_includes_limitations_audit_and_sanitizes_temp_paths() {
 
     // Verify audit structure is present
     assert!(json["audit"].is_object());
-    assert!(json["audit"]["steps"].as_array().unwrap().len() > 0);
+    assert!(!json["audit"]["steps"].as_array().unwrap().is_empty());
     assert_eq!(json["audit"]["final_success"], json["best"]);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
