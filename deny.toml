@@ -8,7 +8,9 @@ all-features = true
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+# paste is a transitive SDK dependency; RUSTSEC-2024-0436 only marks it unmaintained.
+# Revisit this narrow exception when the SDK dependency tree removes paste.
+ignore = ["RUSTSEC-2024-0436"]
 
 [licenses]
 version = 2
