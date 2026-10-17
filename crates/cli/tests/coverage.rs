@@ -193,7 +193,9 @@ fn output_dir_with_text_format_and_open_is_accepted() {
     let path = format!(
         "{}:{}",
         bin.display(),
-        std::env::var_os("PATH").unwrap_or_default().to_string_lossy()
+        std::env::var_os("PATH")
+            .unwrap_or_default()
+            .to_string_lossy()
     );
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"))
         .args([
