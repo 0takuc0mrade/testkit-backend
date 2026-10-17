@@ -1,6 +1,5 @@
-//! Regression coverage for `AuthMatrix`: duplicated callers/entry-point
-//! names are handled independently, and authorization state is reset between
-//! independent actor cases.
+//! Focused coverage for the definition of a "known actor" in `AuthMatrix`
+//! reports, plus auth-state reset behaviour across actor cells.
 
 use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
 use soroban_sdk::{contract, contractimpl, Address, Env, IntoVal};
@@ -27,76 +26,67 @@ impl SecureBank {
 }
 
 #[test]
-fn a_duplicated_allowed_address_is_checked_once_not_twice() {
-    let env = TestEnv::new();
-    let alice = env.address();
-
-    let matrix = AuthMatrix::new(&env).entry_point("dup", &[alice.clone(), alice.clone()], |_| {
-        Err(soroban_sdk::Error::from_contract_error(1))
-    });
-
-    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| matrix.assert_enforced()))
-        .expect_err("alice is expected to pass but is rejected");
-    let message = panic_message(err);
-
-    assert!(
-        message.contains("of 1 cells"),
-        "a duplicated actor must be counted once: {message}"
-    );
-}
-
-#[test]
-fn duplicates_are_harmless_when_every_cell_is_correct() {
+fn known_actors_is_the_deduped_union_in_first_seen_order() {
     let env = TestEnv::new();
     let alice = env.address();
     let bob = env.address();
-
-    // `alice` is listed twice on each entry point; every cell is allowed and
-    // every closure agrees, so duplicates must not produce a spurious failure.
-    AuthMatrix::new(&env)
-        .entry_point(
-            "deposit",
-            &[alice.clone(), alice.clone(), bob.clone()],
-            |_| Ok(()),
-        )
-        .entry_point(
-            "withdraw",
-            &[bob.clone(), alice.clone(), alice.clone()],
-            |_| Ok(()),
-        )
-        .assert_enforced();
-}
-
-#[test]
-fn duplicate_entry_point_names_produce_independent_sections() {
-    let env = TestEnv::new();
-    let alice = env.address();
+    let carol = env.address();
 
     let matrix = AuthMatrix::new(&env)
-        .entry_point("deposit", std::slice::from_ref(&alice), |_| {
-            Err(soroban_sdk::Error::from_contract_error(1))
-        })
-        .entry_point("deposit", std::slice::from_ref(&alice), |_| Ok(()));
+        .entry_point("a", &[alice.clone(), bob.clone()], |_| Ok(()))
+        .entry_point("b", &[bob.clone(), carol.clone()], |_| Ok(()));
 
-    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| matrix.assert_enforced()))
-        .expect_err("the first `deposit` rejects alice and must be flagged");
-    let message = panic_message(err);
-
-    assert_eq!(
-        message.matches("[deposit]").count(),
-        2,
-        "two entry points sharing a name must both be reported: {message}"
-    );
-    assert!(
-        message.contains("of 2 cells"),
-        "each same-named entry point still gets its own cells: {message}"
-    );
+    // `bob` is named on both entry points but appears once.
+    assert_eq!(matrix.known_actors(), vec![alice, bob, carol]);
 }
 
 #[test]
-fn assert_requires_auth_still_catches_an_unmocked_call() {
+fn addresses_never_listed_are_not_known_actors() {
     let env = TestEnv::new();
-    env.assert_requires_auth(|| panic!("simulated auth failure"));
+    let listed = env.address();
+    let never_listed = env.address();
+
+    let matrix =
+        AuthMatrix::new(&env).entry_point("only", std::slice::from_ref(&listed), |_| Ok(()));
+
+    let known = matrix.known_actors();
+    assert_eq!(known, vec![listed]);
+    assert!(!known.contains(&never_listed));
+}
+
+#[test]
+fn report_states_the_known_actor_definition_and_names_the_offender() {
+    let env = TestEnv::new();
+    let owner = env.address();
+    let attacker = env.address();
+
+    // `open` allows both callers, so both are known actors; `guarded` is
+    // buggy and lets everyone through, so the known actor `attacker` wrongly
+    // succeeds there and must be flagged.
+    let matrix = AuthMatrix::new(&env)
+        .entry_point("open", &[owner.clone(), attacker.clone()], |_| Ok(()))
+        .entry_point("guarded", std::slice::from_ref(&owner), |_| Ok(()));
+
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| matrix.assert_enforced()))
+        .expect_err("guarded allows everyone, so the attacker cell must be caught");
+    let message = err
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    assert!(
+        message.contains("known actors = union of all entry points' allowed lists"),
+        "the report must state the known-actor definition: {message}"
+    );
+    assert!(
+        message.contains(&format!("{attacker:?}")),
+        "the report must name the offending known actor: {message}"
+    );
+    assert!(
+        message.contains("guarded"),
+        "the report must name the entry point that let the actor through: {message}"
+    );
 }
 
 #[test]

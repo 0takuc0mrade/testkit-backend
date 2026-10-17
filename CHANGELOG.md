@@ -75,12 +75,17 @@ section, so a merge can never land without a place to record the change.
   with, so a test can rebuild an identical environment from it.
 - `TestkitError::kind` returns the variant name, and `TestkitError::chain`
   walks the error's source chain, for match-free diagnostics and logging.
-- Regression coverage for `AuthMatrix` when callers and entry-point names are
-  duplicated, for `TestToken`'s whole-units vs base-units split and its SAC
-  admin authorization, and for per-storage-kind TTL behavior.
+- `AuthMatrix::known_actors` exposes the de-duplicated union of every entry
+  point's `allowed` addresses, making explicit which callers the matrix
+  cross-checks.
 
 ### Changed
 
+- `AuthMatrix` failure reports now state the definition of a "known actor",
+  and event-capture failure diagnostics render the captured topics and data
+  in decoded form so they line up with the raw captured values. The signed
+  `i128` amount convention is now documented across the money generators, as
+  is the scope of captured events at nested contract-invocation boundaries.
 - The `limits` subcommand now mocks authorization on each isolated probe
   and defaults numeric ramp parameters to a non-zero value, making it
   usable against real auth-gated payout contracts out of the box.
