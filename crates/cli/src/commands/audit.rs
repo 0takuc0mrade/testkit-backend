@@ -387,9 +387,9 @@ impl<'a> DiagnosticRenderer<'a> {
     /// Render diagnostics according to the specified output format.
     pub fn render(&self, format: AuditOutputFormat) -> Result<String, CliError> {
         match format {
-            AuditOutputFormat::Text => Ok(self.render_text()),
-            AuditOutputFormat::Json => self.render_json(),
-            AuditOutputFormat::Sarif => self.render_sarif(),
+            AuditOutputFormat::Text => Ok(render_text(self.findings)),
+            AuditOutputFormat::Json => render_json(self.findings),
+            AuditOutputFormat::Sarif => render_sarif(self.findings),
         }
     }
 
