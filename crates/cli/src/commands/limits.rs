@@ -786,21 +786,33 @@ fn wait_with_timeout(
             return Ok(Some(status));
         }
         if Instant::now() >= deadline {
-            // A child can exit between polling and kill; wait reaps either way.
-            let killed = child.kill();
-            child.wait().map_err(|err| {
-                CliError(format!(
-                    "failed to reap timed-out probe process {}: {err}",
-                    child.id()
-                ))
-            })?;
-            if let Err(err) = killed {
-                if err.kind() != std::io::ErrorKind::InvalidInput {
-                    return Err(CliError(format!(
-                        "failed to terminate timed-out probe process {}: {err}",
-                        child.id()
-                    )));
+            // A child can exit between polling and kill. In that race,
+            // try_wait reaps it; otherwise report the failed termination.
+            match child.kill() {
+                Ok(()) => {
+                    child.wait().map_err(|err| {
+                        CliError(format!(
+                            "failed to reap timed-out probe process {}: {err}",
+                            child.id()
+                        ))
+                    })?;
                 }
+                Err(kill_err) => match child.try_wait() {
+                    Ok(Some(_)) => {} // Already exited and reaped.
+                    Ok(None) => {
+                        return Err(CliError(format!(
+                            "failed to terminate timed-out probe process {}: {kill_err}",
+                            child.id()
+                        )));
+                    }
+                    Err(poll_err) => {
+                        return Err(CliError(format!(
+                            "failed to terminate or poll timed-out probe process {}: \
+                             kill: {kill_err}; poll: {poll_err}",
+                            child.id()
+                        )));
+                    }
+                },
             }
             return Ok(None);
         }
