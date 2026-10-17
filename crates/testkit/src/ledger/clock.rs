@@ -672,6 +672,22 @@ impl TestEnv {
     /// schedule) at several points in time without each call site having to
     /// save and restore the clock by hand.
     ///
+    /// Inside the scope the ledger reports a **coherent** position: the
+    /// timestamp is `timestamp`, and the sequence number is the one the
+    /// clock would hold at that time — the entry sequence shifted by
+    /// `ceil((timestamp - entry_timestamp) / ` [`close
+    /// interval`](TestEnv::ledger_close_interval) `)`, saturating at `0`
+    /// and `u32::MAX` when the target falls outside the sequence number's
+    /// range. The scope never leaves the newer (or older) pre-scope
+    /// sequence number sitting next to the scoped timestamp, so an
+    /// [`TestEnv::advance`] inside the scope moves the clock from the
+    /// scoped position rather than from state the scope replaced.
+    ///
+    /// On exit — normal return or panic — the complete entry snapshot
+    /// (timestamp, sequence number, and every other recorded ledger field)
+    /// is written back, so the newer pre-scope position is restored
+    /// intact and nothing the scope touched leaks out.
+    ///
     /// # Example
     ///
     /// ```
@@ -685,7 +701,11 @@ impl TestEnv {
     /// ```
     pub fn at<T>(&self, timestamp: u64, f: impl FnOnce() -> T) -> T {
         let original = self.env().ledger().get();
-        self.env().ledger().set_timestamp(timestamp);
+        self.env().ledger().set(soroban_sdk::testutils::LedgerInfo {
+            timestamp,
+            sequence_number: scoped_sequence(&original, timestamp, self.ledger_close_interval()),
+            ..original.clone()
+        });
         let result = panic::catch_unwind(AssertUnwindSafe(f));
         self.env().ledger().set(original);
         match result {
@@ -740,6 +760,31 @@ fn calendar_secs(helper: &str, count: u64, secs_per_unit: u64) -> Result<u64, Te
              {count} * {secs_per_unit}s does not fit in a u64 number of seconds"
         ))
     })
+}
+
+/// The sequence number the ledger reports at `timestamp`, given the position
+/// recorded in `info` and the environment's `interval` seconds per ledger.
+///
+/// The mapping mirrors [`TestEnv::advance`]: elapsed (or rewound) seconds
+/// map to `ceil(seconds / interval)` ledgers, applied to `info`'s own
+/// timestamp/sequence pair so an environment seeded with a non-zero offset
+/// keeps that offset at the target time. The result saturates at `0` and
+/// `u32::MAX` — a scoped evaluation is total, so a target outside the
+/// sequence number's range clamps rather than panicking or wrapping.
+fn scoped_sequence(
+    info: &soroban_sdk::testutils::LedgerInfo,
+    timestamp: u64,
+    interval: u64,
+) -> u32 {
+    let interval = i128::from(interval);
+    let delta = i128::from(timestamp) - i128::from(info.timestamp);
+    // Ceiling division, so a rewind mirrors `advance`'s round-up in the
+    // forward direction. `interval` is never zero (see
+    // `with_ledger_close_interval`), so this cannot divide by zero.
+    let whole = delta.div_euclid(interval);
+    let ledgers = whole + if delta.rem_euclid(interval) > 0 { 1 } else { 0 };
+    let scoped = i128::from(info.sequence_number) + ledgers;
+    scoped.clamp(0, i128::from(u32::MAX)) as u32
 }
 
 #[cfg(test)]
@@ -887,6 +932,128 @@ mod tests {
         assert_eq!(after.timestamp, before.timestamp);
         assert_eq!(after.protocol_version, before.protocol_version);
         assert_eq!(after.network_id, before.network_id);
+    }
+
+    // --- scoped clock coherence (#465) ----------------------------------
+
+    // Regression: `at` used to write only the timestamp, so inside the
+    // scope the ledger reported the *newer* pre-scope sequence next to the
+    // scoped timestamp. A scoped evaluation of a past moment then saw a
+    // future ledger number, and any `advance` inside the scope computed
+    // from that newer state.
+    #[test]
+    fn at_sets_a_coherent_sequence_for_the_scoped_timestamp() {
+        let env = TestEnv::new();
+        env.advance(Duration::from_secs(100)); // (timestamp 100, sequence 20)
+
+        let seen = env.at(40, || (env.now(), env.sequence()));
+
+        assert_eq!(
+            seen,
+            (40, 8),
+            "the scope must report the sequence that belongs to its timestamp"
+        );
+        assert_eq!(clock(&env), (100, 20));
+    }
+
+    #[test]
+    fn at_rounds_the_scoped_sequence_up_like_advance() {
+        let env = TestEnv::new();
+        env.advance(Duration::from_secs(100)); // (100, 20)
+
+        // Rewinding 58s is 11.6 ledgers; rounding up (as `advance` does in
+        // the forward direction) lands 11 ledgers back.
+        assert_eq!(env.at(42, || env.sequence()), 9);
+    }
+
+    #[test]
+    fn at_preserves_a_seeded_timestamp_sequence_offset() {
+        let env = TestEnv::with_ledger_defaults(
+            crate::core::LedgerDefaults::new()
+                .timestamp(1_700_000_000)
+                .sequence_number(1_000),
+        );
+
+        let seen = env.at(1_700_000_000 - 100, || (env.now(), env.sequence()));
+
+        assert_eq!(seen, (1_700_000_000 - 100, 980));
+        assert_eq!(clock(&env), (1_700_000_000, 1_000));
+    }
+
+    // The scope's restore must return the newer pre-scope clock intact —
+    // it must not be left at, or overwritten by, the scoped position.
+    #[test]
+    fn at_restores_the_newer_pre_scope_sequence_on_exit() {
+        let env = TestEnv::new();
+        env.advance(Duration::from_secs(100)); // (100, 20) — newer than the scope
+        let before = clock(&env);
+
+        env.at(0, || {
+            assert_eq!(
+                clock(&env),
+                (0, 0),
+                "the scope must not report the newer pre-scope sequence"
+            );
+        });
+
+        assert_eq!(
+            clock(&env),
+            before,
+            "the newer pre-scope state must be restored intact"
+        );
+    }
+
+    #[test]
+    fn at_clamps_the_scoped_sequence_at_zero_for_a_target_before_the_origin() {
+        let env = TestEnv::with_ledger_defaults(
+            crate::core::LedgerDefaults::new()
+                .timestamp(1_000_000)
+                .sequence_number(1),
+        );
+
+        let seen = env.at(0, || env.sequence());
+
+        assert_eq!(seen, 0, "a far-past target must clamp at sequence 0");
+        assert_eq!(clock(&env), (1_000_000, 1));
+    }
+
+    #[test]
+    fn at_saturates_the_scoped_sequence_at_u32_max_for_a_far_future_target() {
+        let env = TestEnv::new();
+        let before = clock(&env);
+
+        let seen = env.at(u64::MAX, || env.sequence());
+
+        assert_eq!(seen, u32::MAX);
+        assert_eq!(clock(&env), before);
+    }
+
+    #[test]
+    fn advance_inside_at_computes_from_the_scoped_sequence() {
+        let env = TestEnv::new();
+        env.advance(Duration::from_secs(100)); // (100, 20)
+
+        env.at(40, || {
+            // Scoped at (40, 8); ten more seconds adds two ledgers.
+            env.advance(Duration::from_secs(10));
+            assert_eq!(clock(&env), (50, 10));
+        });
+
+        assert_eq!(clock(&env), (100, 20));
+    }
+
+    #[test]
+    fn nested_at_scopes_chain_their_sequences() {
+        let env = TestEnv::new();
+        env.advance(Duration::from_secs(100)); // (100, 20)
+
+        let seen = env.at(50, || {
+            // Outer scope: (50, 10).
+            env.at(70, || (env.now(), env.sequence())) // inner: (70, 14)
+        });
+
+        assert_eq!(seen, (70, 14));
+        assert_eq!(clock(&env), (100, 20));
     }
 
     // --- advance overflow rejection -------------------------------------
