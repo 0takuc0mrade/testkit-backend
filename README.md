@@ -93,7 +93,9 @@ soroban-testkit coverage --format html --open
 soroban-testkit coverage --format json --output coverage.json
 
 # Empirically find how many recipients a batch operation can handle
-# before it exceeds mainnet resource limits.
+# before it exceeds mainnet resource limits. Build successfully first so
+# a failed rebuild cannot leave limits measuring an older WASM artifact.
+cargo build -p my_contract --target wasm32v1-none --release &&
 soroban-testkit limits --contract target/wasm32v1-none/release/my_contract.wasm \
   --fn batch_payout --ramp recipients
 

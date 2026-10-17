@@ -92,6 +92,13 @@ section, so a merge can never land without a place to record the change.
 
 ### Fixed
 
+- Validate the `limits` success/failure bracket before binary refinement and
+  report unstable probe results with recovery guidance (#442).
+- Clamp doubled ramp values to the search cap without integer overflow (#443).
+- Rebuild the limits test fixture before use and reject failed rebuilds even
+  when an older WASM artifact exists (#449).
+- Explain how to recover from a missing or unreadable `--contract` file (#450).
+
 - `TestEnv::at` now enters its scope with a coherent ledger position: the
   sequence number is derived from the scoped timestamp and the environment's
   ledger close interval (saturating at the ends of the range) instead of
