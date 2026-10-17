@@ -27,7 +27,8 @@ fn vault_manifest_supports_cdylib_and_rlib() {
          so it can compile to a wasm binary and be used as a Rust dependency."
     );
     assert!(
-        vault_cargo.contains("no_std") || read_repo_file("examples/vault/src/lib.rs").contains("#![no_std]"),
+        vault_cargo.contains("no_std")
+            || read_repo_file("examples/vault/src/lib.rs").contains("#![no_std]"),
         "examples/vault must be #![no_std] to compile for wasm targets."
     );
 }

@@ -180,14 +180,19 @@ fn audit_sarif_output_reports_findings_and_rules() {
     assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["version"], "2.1.0");
-    assert_eq!(report["runs"][0]["tool"]["driver"]["name"], "soroban-testkit");
+    assert_eq!(
+        report["runs"][0]["tool"]["driver"]["name"],
+        "soroban-testkit"
+    );
     let results = report["runs"][0]["results"].as_array().unwrap();
     assert!(!results.is_empty());
     assert_eq!(results[0]["ruleId"], "missing-require-auth");
-    assert!(results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
-        .as_str()
-        .unwrap()
-        .contains("vault.rs"));
+    assert!(
+        results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+            .as_str()
+            .unwrap()
+            .contains("vault.rs")
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -226,7 +231,11 @@ fn audit_formats_handle_clean_crate_consistently() {
     let root = std::env::temp_dir().join(format!("stk-audit-clean-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/clean.rs"), "// clean code with no findings\n").unwrap();
+    std::fs::write(
+        root.join("src/clean.rs"),
+        "// clean code with no findings\n",
+    )
+    .unwrap();
 
     let text_out = run(&["audit", root.to_str().unwrap(), "--format", "text"]);
     let json_out = run(&["audit", root.to_str().unwrap(), "--format", "json"]);
@@ -243,7 +252,10 @@ fn audit_formats_handle_clean_crate_consistently() {
     assert_eq!(json_report["summary"]["finding_count"], 0);
 
     let sarif_report: serde_json::Value = serde_json::from_slice(&sarif_out.stdout).unwrap();
-    assert_eq!(sarif_report["runs"][0]["results"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        sarif_report["runs"][0]["results"].as_array().unwrap().len(),
+        0
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

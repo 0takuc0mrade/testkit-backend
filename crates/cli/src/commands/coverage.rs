@@ -208,7 +208,48 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
 
     validate_coverage_outputs(&args)?;
 
+    if args.open {
+        open_html_report(args.output_dir.as_deref())?;
+    }
+
     Ok(())
+}
+
+/// Opens the generated HTML report in the system's default browser.
+///
+/// This is called **only** after [`validate_coverage_outputs`] confirms the
+/// report exists, so the browser is never launched when generation failed.
+pub(crate) fn open_html_report(output_dir: Option<&std::path::Path>) -> Result<(), CliError> {
+    let dir = output_dir.unwrap_or(std::path::Path::new("."));
+    let index_path = dir.join("index.html");
+
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(target_os = "windows")]
+    let opener = "cmd";
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let opener = "xdg-open";
+
+    #[cfg(target_os = "windows")]
+    let status = std::process::Command::new(opener)
+        .args(["/c", "start", "", &index_path.to_string_lossy()])
+        .status();
+    #[cfg(not(target_os = "windows"))]
+    let status = std::process::Command::new(opener).arg(&index_path).status();
+
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(CliError(format!(
+            "browser opener exited with {s} when trying to open '{}'; \
+             open the file directly in your browser, or omit `--open` in headless/CI environments",
+            index_path.display()
+        ))),
+        Err(err) => Err(CliError(format!(
+            "failed to launch browser opener ({opener}): {err}; \
+             open '{}' directly in your browser, or omit `--open` in headless/CI environments",
+            index_path.display()
+        ))),
+    }
 }
 
 pub(crate) fn prepare_output_destinations(args: &CoverageArgs) -> Result<(), CliError> {
@@ -531,9 +572,8 @@ fn coverage_failure_message(
     if open_requested {
         format!(
             "coverage run failed (cargo llvm-cov exited with {status}); \
-             if opening the HTML report in a browser failed, ensure your platform has a supported \
-             desktop browser opener (e.g. xdg-open on Linux, open on macOS, start on Windows), or \
-             omit `--open` when running in headless/CI environments"
+             the HTML report was not generated so the browser will not be opened — \
+             check the coverage run output above for errors"
         )
     } else {
         format!(
@@ -567,6 +607,14 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
             "--open is only valid with --format html (got --format {})",
             args.format
         )));
+    }
+    if args.output_dir.is_some() && matches!(args.format, Format::Text) && !args.open {
+        return Err(CliError(
+            "--output-dir is not valid with --format text; \
+             text output is written to the terminal — use --format html, --format lcov, or --format json to write files, \
+             or add --open to generate an HTML report and open it"
+                .to_string(),
+        ));
     }
 
     let mut cmd = Command::new("cargo");
@@ -616,10 +664,6 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
             });
             cmd.arg("--output-path").arg(output_path);
         }
-    }
-
-    if args.open {
-        cmd.arg("--open");
     }
 
     if let Some(pct) = args.fail_under {
@@ -904,8 +948,11 @@ mod tests {
         a.open = true;
         let cmd = build_command(&a).unwrap();
         let rendered = rendered_args(&cmd);
+        // --html is passed to the subprocess so llvm-cov generates the report
         assert!(rendered.contains(&"--html".to_string()));
-        assert!(rendered.contains(&"--open".to_string()));
+        // --open is NOT forwarded to the subprocess; the CLI opens the browser
+        // itself only after validate_coverage_outputs confirms the report exists
+        assert!(!rendered.contains(&"--open".to_string()));
     }
 
     #[test]
@@ -915,8 +962,11 @@ mod tests {
         a.open = true;
         let cmd = build_command(&a).unwrap();
         let rendered = rendered_args(&cmd);
+        // --html is passed to the subprocess
         assert!(rendered.contains(&"--html".to_string()));
-        assert!(rendered.contains(&"--open".to_string()));
+        // --open is NOT forwarded to the subprocess; the CLI opens the browser
+        // itself only after validate_coverage_outputs confirms the report exists
+        assert!(!rendered.contains(&"--open".to_string()));
     }
 
     #[test]
@@ -1037,8 +1087,11 @@ mod tests {
         );
 
         let msg_open = coverage_failure_message(status, true, None);
-        assert!(msg_open.contains("desktop browser opener"), "{msg_open}");
-        assert!(msg_open.contains("headless/CI"), "{msg_open}");
+        assert!(
+            msg_open.contains("HTML report was not generated so the browser will not be opened"),
+            "{msg_open}"
+        );
+        assert!(!msg_open.contains("desktop browser opener"), "{msg_open}");
 
         let msg_fail_under = coverage_failure_message(status, false, Some(85.5));
         assert!(
@@ -1185,5 +1238,121 @@ mod tests {
         assert!(validate_coverage_outputs(&a).is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Bug 1 regression: no browser open when HTML generation failed ─────────
+
+    #[test]
+    fn open_is_not_forwarded_to_subprocess_for_text_open() {
+        // With --format text --open, the subprocess receives --html but NOT --open.
+        // The CLI opens the browser itself, only after confirming the report exists.
+        let mut a = args(&[], &[]);
+        a.format = Format::Text;
+        a.open = true;
+        let cmd = build_command(&a).unwrap();
+        let rendered = rendered_args(&cmd);
+        assert!(
+            rendered.contains(&"--html".to_string()),
+            "expected --html in subprocess args: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&"--open".to_string()),
+            "--open must NOT be forwarded to the subprocess: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn open_is_not_forwarded_to_subprocess_for_html_open() {
+        // With --format html --open, the subprocess receives --html but NOT --open.
+        let mut a = args(&[], &[]);
+        a.format = Format::Html;
+        a.open = true;
+        let cmd = build_command(&a).unwrap();
+        let rendered = rendered_args(&cmd);
+        assert!(
+            rendered.contains(&"--html".to_string()),
+            "expected --html in subprocess args: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&"--open".to_string()),
+            "--open must NOT be forwarded to the subprocess: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn coverage_failure_message_with_open_reports_html_not_generated() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(256); // exit code 1
+        let msg = coverage_failure_message(status, true, None);
+        assert!(
+            msg.contains("HTML report was not generated so the browser will not be opened"),
+            "failure message should mention browser will not be opened: {msg}"
+        );
+        // Must NOT claim it tried to open a browser
+        assert!(
+            !msg.contains("desktop browser opener"),
+            "failure message must not claim browser open was attempted: {msg}"
+        );
+    }
+
+    // ── Bug 2 regression: --output-dir rejected with --format text ────────────
+
+    #[test]
+    fn output_dir_with_text_format_and_no_open_is_rejected() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Text;
+        a.output_dir = Some(std::path::PathBuf::from("./coverage"));
+        // --open is false (default) — this combination must be rejected
+        let err = build_command(&a).unwrap_err();
+        assert!(
+            err.0
+                .contains("--output-dir is not valid with --format text"),
+            "expected rejection of --output-dir + --format text: {}",
+            err.0
+        );
+        assert!(
+            err.0.contains("text output is written to the terminal"),
+            "error should explain text goes to terminal: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn output_dir_with_text_format_and_open_is_allowed() {
+        // --format text --open --output-dir is valid: it generates an HTML report
+        // (not text output) and the CLI opens the browser after success.
+        let mut a = args(&[], &[]);
+        a.format = Format::Text;
+        a.open = true;
+        a.output_dir = Some(std::path::PathBuf::from("./coverage"));
+        assert!(
+            build_command(&a).is_ok(),
+            "--format text --open --output-dir should be accepted"
+        );
+    }
+
+    #[test]
+    fn output_dir_with_html_format_is_always_allowed() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Html;
+        a.output_dir = Some(std::path::PathBuf::from("./reports"));
+        assert!(build_command(&a).is_ok());
+    }
+
+    #[test]
+    fn output_dir_with_lcov_format_is_always_allowed() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Lcov;
+        a.output_dir = Some(std::path::PathBuf::from("./reports"));
+        assert!(build_command(&a).is_ok());
+    }
+
+    #[test]
+    fn output_dir_with_json_format_is_always_allowed() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output_dir = Some(std::path::PathBuf::from("./reports"));
+        assert!(build_command(&a).is_ok());
     }
 }

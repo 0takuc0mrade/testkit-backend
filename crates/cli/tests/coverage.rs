@@ -135,3 +135,64 @@ fn format_names_are_consistent_in_errors_and_help() {
         "{stderr_lcov}"
     );
 }
+
+// ── Bug 1 regression: no browser opened when HTML generation fails ────────────
+
+#[test]
+fn open_rejected_for_non_html_non_text_formats_is_actionable() {
+    // Already covered by open_option_rejected_for_incompatible_formats, but
+    // explicitly verifies the error is actionable and doesn't mention browser
+    // launch when the real problem is the format mismatch.
+    let output = run(&["coverage", "--format", "json", "--open"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--open is only valid with --format html"),
+        "{stderr}"
+    );
+    // The rejection happens before any subprocess or browser launch attempt
+    assert!(
+        !stderr.contains("browser opener"),
+        "early validation should not mention browser opener: {stderr}"
+    );
+}
+
+// ── Bug 2 regression: --output-dir rejected with incompatible formats ─────────
+
+#[test]
+fn output_dir_with_text_format_is_rejected_with_actionable_error() {
+    let output = run(&["coverage", "--format", "text", "--output-dir", "/tmp/cov"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--output-dir is not valid with --format text"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("text output is written to the terminal"),
+        "error should explain why: {stderr}"
+    );
+}
+
+#[test]
+fn output_dir_with_text_format_and_open_is_accepted() {
+    // --format text --open --output-dir is the one valid combination:
+    // it generates an HTML report into the given directory and opens it.
+    // This test only checks that the CLI accepts the argument combination
+    // (it will fail later because cargo-llvm-cov is not necessarily installed,
+    // but argument validation must pass).
+    let output = run(&[
+        "coverage",
+        "--format",
+        "text",
+        "--open",
+        "--output-dir",
+        "/tmp/stk-test-open-dir",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The combination must NOT be rejected with the incompatible-format error
+    assert!(
+        !stderr.contains("--output-dir is not valid with --format text"),
+        "valid combination was wrongly rejected: {stderr}"
+    );
+}

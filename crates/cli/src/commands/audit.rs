@@ -441,7 +441,8 @@ impl<'a> DiagnosticRenderer<'a> {
                 rule_obj
             })
             .collect();
-        let results: Vec<_> = self.findings
+        let results: Vec<_> = self
+            .findings
             .iter()
             .map(|finding| {
                 let level = match finding.severity.as_str() {
@@ -475,7 +476,10 @@ impl<'a> DiagnosticRenderer<'a> {
     }
 }
 
-pub fn render_findings(findings: &[Finding], format: AuditOutputFormat) -> Result<String, CliError> {
+pub fn render_findings(
+    findings: &[Finding],
+    format: AuditOutputFormat,
+) -> Result<String, CliError> {
     DiagnosticRenderer::new(findings).render(format)
 }
 

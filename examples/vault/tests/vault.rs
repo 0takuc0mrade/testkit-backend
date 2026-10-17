@@ -1,9 +1,6 @@
 #![cfg(feature = "testutils")]
 
-use soroban_sdk::{
-    testutils::Address as _,
-    Address, Env,
-};
+use soroban_sdk::{testutils::Address as _, Address, Env};
 use vault::{Vault, VaultClient, VaultError};
 
 #[test]
