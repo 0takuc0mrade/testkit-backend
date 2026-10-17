@@ -28,6 +28,11 @@ fn ensure_vault_wasm() -> PathBuf {
     let wasm = workspace_root().join("target/wasm32v1-none/release/vault.wasm");
     if !wasm.exists() {
         let build = Command::new("cargo")
+            // The outer cargo-llvm-cov run instruments native tests. This nested
+            // WASM fixture build must not inherit its unsupported coverage flags.
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("CARGO_TARGET_WASM32V1_NONE_RUSTFLAGS")
             .args([
                 "build",
                 "-p",
