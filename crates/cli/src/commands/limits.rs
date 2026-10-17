@@ -452,11 +452,16 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
             // is retained: later failures in the same run typically have the
             // same root cause, and keeping one keeps the report concise.
             if first_failed_probe_stderr.is_none() {
-                if let Ok(stderr) = child.child.stderr.take().map_or(Ok(String::new()), |mut s| {
-                    use std::io::Read;
-                    let mut buf = String::new();
-                    s.read_to_string(&mut buf).map(|_| buf)
-                }) {
+                if let Ok(stderr) = child
+                    .child
+                    .stderr
+                    .take()
+                    .map_or(Ok(String::new()), |mut s| {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        s.read_to_string(&mut buf).map(|_| buf)
+                    })
+                {
                     if !stderr.trim().is_empty() {
                         first_failed_probe_stderr = Some(stderr);
                     }
@@ -772,16 +777,16 @@ impl Drop for ProbeChild {
 /// Poll one child until it exits or exceeds its deadline. A timeout kills
 /// and reaps before returning None. Errors name the process rather than
 /// silently claiming a resource ceiling. ProbeChild handles early errors.
-fn wait_with_timeout(
-    child: &mut Child,
-    timeout: Duration,
-) -> Result<Option<ExitStatus>, CliError> {
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>, CliError> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| CliError("probe timeout is too large for the host clock".to_string()))?;
     loop {
         if let Some(status) = child.try_wait().map_err(|err| {
-            CliError(format!("failed to poll isolated probe process {}: {err}", child.id()))
+            CliError(format!(
+                "failed to poll isolated probe process {}: {err}",
+                child.id()
+            ))
         })? {
             return Ok(Some(status));
         }
@@ -1821,7 +1826,6 @@ mod tests {
             "should have killed the child near the timeout, not waited for it to finish"
         );
     }
-
 
     #[test]
     fn shell_quote_protects_paths_with_spaces_and_single_quotes() {
