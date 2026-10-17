@@ -30,7 +30,12 @@ allow = [
     "CC0-1.0",
 ]
 confidence-threshold = 0.8
-exceptions = []
+# The older wasmparser dependencies shipped by the Soroban SDK use the LLVM
+# exception; allow that specific SPDX expression only for these crate versions.
+exceptions = [
+    { name = "wasmparser", version = "=0.116.1", allow = ["Apache-2.0 WITH LLVM-exception"] },
+    { name = "wasmparser-nostd", version = "=0.100.2", allow = ["Apache-2.0 WITH LLVM-exception"] },
+]
 
 [bans]
 multiple-versions = "warn"
