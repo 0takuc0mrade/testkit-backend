@@ -182,10 +182,7 @@ fn output_dir_with_text_format_and_open_is_accepted() {
     // Stub Cargo so this integration test checks argument validation without
     // recursively running cargo-llvm-cov while the outer coverage job is
     // instrumenting this very test binary. The previous test could hang CI.
-    let root = std::env::temp_dir().join(format!(
-        "stk-coverage-accept-{}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("stk-coverage-accept-{}", std::process::id()));
     let bin = root.join("bin");
     let report = root.join("report");
     std::fs::create_dir_all(&bin).unwrap();
