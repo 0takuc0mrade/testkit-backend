@@ -3,7 +3,17 @@ use soroban_sdk::{xdr, Address, Env, IntoVal, TryFromVal, Val};
 
 use crate::core::{TestEnv, TestkitError};
 
-/// A single contract event, decoded into ergonomic SDK types.
+/// A single contract event, captured from the environment.
+///
+/// `topics` and `data` are the **raw** `Val`s exactly as published — the same
+/// values `soroban_sdk` captured for the event — held as `Val` so they can be
+/// compared and decoded on demand (for example with
+/// [`EventLog::decode_one`]). They are not eagerly converted into other types.
+///
+/// [`EventLog::diagnostics`] prints those raw values in their decoded form
+/// (`contract=... topics=[Symbol(mint)] data=i128(1)`), which is exactly what
+/// assertion-failure diagnostics include, so the diagnostic a failed
+/// assertion shows is always aligned with the event that was captured.
 #[derive(Debug, Clone)]
 pub struct CapturedEvent {
     /// The contract that published the event.
@@ -64,7 +74,7 @@ impl CapturedEvent {
 /// return a new `EventLog`, so they chain:
 /// `env.events().from(&contract).with_topic(symbol_short!("transfer"))`.
 ///
-/// # A note on scope
+/// # A note on scope and nested invocations
 ///
 /// `soroban_sdk::testutils::Events::all` — which this is built on — returns
 /// events from the most recent top-level contract invocation, not a full
@@ -72,6 +82,22 @@ impl CapturedEvent {
 /// soroban-sdk 27.0.6; its own doc comment says as much). Call
 /// [`TestEnv::events`] or [`TestEnv::events_during`] right after the
 /// invocation you want to inspect.
+///
+/// This is what makes the log cover **nested** calls correctly:
+///
+/// - Events published by a sub-contract call made from inside the invoked
+///   entry point are included, no matter how deep the nesting goes. Each event
+///   is attributed to the contract that actually published it (its
+///   [`CapturedEvent::contract`]), not to the top-level entry point.
+/// - All nested calls made during one top-level invocation accumulate into
+///   the same log; a depth-2 call is not a separate capture window.
+/// - The window is bounded by the **top-level** invocation: starting the next
+///   top-level call (for example the next client method call from the test)
+///   resets the captured log, so events from the previous top-level call are
+///   no longer returned.
+///
+/// In short: one log per top-level call, spanning every nested sub-call of
+/// that call.
 #[derive(Clone)]
 pub struct EventLog {
     pub(crate) env: Env,

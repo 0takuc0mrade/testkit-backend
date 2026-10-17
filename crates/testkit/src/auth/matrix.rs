@@ -16,8 +16,21 @@ struct EntryPointSpec<'a> {
 ///
 /// Register each privileged entry point with [`AuthMatrix::entry_point`],
 /// then call [`AuthMatrix::assert_enforced`] to check that every allowed
-/// address succeeds and every other address known to the matrix is
-/// rejected, for every entry point.
+/// address succeeds and every other **known actor** is rejected, for every
+/// entry point.
+///
+/// # What counts as a "known actor"
+///
+/// A *known actor* is any address named in at least one entry point's
+/// `allowed` list — the de-duplicated union across every registered entry
+/// point, returned by [`AuthMatrix::known_actors`]. The matrix cross-checks
+/// each known actor against *every* entry point, not only the one that named
+/// it: that is how an actor permitted elsewhere gets caught on a privileged
+/// entry point that should have rejected it.
+///
+/// An address that is never listed on any entry point is **not** a known
+/// actor and is never placed in the grid, so a caller that should be rejected
+/// must still be named on at least one entry point to be covered.
 pub struct AuthMatrix<'a> {
     // Ties the matrix's lifetime to its TestEnv; entry point closures
     // capture their own references into it independently.
@@ -57,6 +70,42 @@ impl<'a> AuthMatrix<'a> {
         self
     }
 
+    /// The matrix's **known actors**: every address named in any entry
+    /// point's `allowed` list, de-duplicated and kept in first-seen order.
+    ///
+    /// These are exactly the addresses [`AuthMatrix::assert_enforced`] places
+    /// in its grid; an address that never appears as `allowed` on any entry
+    /// point is not a known actor and is not checked.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::auth::AuthMatrix;
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let alice = env.address();
+    /// let bob = env.address();
+    ///
+    /// let matrix = AuthMatrix::new(&env)
+    ///     .entry_point("a", &[alice.clone()], |_| Ok(()))
+    ///     .entry_point("b", &[alice.clone(), bob.clone()], |_| Ok(()));
+    ///
+    /// // `alice` is named on both entry points but appears once.
+    /// assert_eq!(matrix.known_actors(), vec![alice, bob]);
+    /// ```
+    pub fn known_actors(&self) -> Vec<Address> {
+        let mut known: Vec<Address> = Vec::new();
+        for ep in &self.entry_points {
+            for addr in &ep.allowed {
+                if !known.contains(addr) {
+                    known.push(addr.clone());
+                }
+            }
+        }
+        known
+    }
+
     /// Reset all authorization entries and mock authorizations in the test environment.
     ///
     /// # Example
@@ -74,8 +123,8 @@ impl<'a> AuthMatrix<'a> {
     }
 
     /// For every registered entry point, assert every allowed address
-    /// succeeds and every other address known to the matrix (i.e. named as
-    /// `allowed` on *some* entry point) fails.
+    /// succeeds and every other **known actor** (see [`AuthMatrix`] and
+    /// [`AuthMatrix::known_actors`]) fails.
     ///
     /// # Panics
     ///
@@ -106,17 +155,14 @@ impl<'a> AuthMatrix<'a> {
     ///     .assert_enforced();
     /// ```
     pub fn assert_enforced(self) {
-        let mut known: Vec<Address> = Vec::new();
-        for ep in &self.entry_points {
-            for addr in &ep.allowed {
-                if !known.contains(addr) {
-                    known.push(addr.clone());
-                }
-            }
-        }
+        let known = self.known_actors();
 
         let mut violations = Vec::new();
-        let mut grid = String::new();
+        let mut grid = format!(
+            "known actors = union of all entry points' allowed lists ({} address(es)); \
+             each is checked against every entry point\n",
+            known.len()
+        );
 
         for ep in &self.entry_points {
             grid.push_str(&format!("  [{}]\n", ep.name));
@@ -234,6 +280,74 @@ mod tests {
             Ok(Ok(_)) => Ok(()),
             _ => Err(soroban_sdk::Error::from_contract_error(0)),
         }
+    }
+
+    fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
+        err.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn known_actors_is_the_deduped_union_in_first_seen_order() {
+        let env = TestEnv::new();
+        let alice = env.address();
+        let bob = env.address();
+        let carol = env.address();
+
+        let matrix = AuthMatrix::new(&env)
+            .entry_point("a", &[alice.clone(), bob.clone()], |_| Ok(()))
+            .entry_point("b", &[bob.clone(), carol.clone()], |_| Ok(()));
+
+        // `bob` is named on both entry points but appears once; order follows
+        // first appearance.
+        assert_eq!(matrix.known_actors(), vec![alice, bob, carol]);
+    }
+
+    #[test]
+    fn known_actors_ignores_addresses_never_listed() {
+        let env = TestEnv::new();
+        let listed = env.address();
+        let never_listed = env.address();
+
+        let matrix =
+            AuthMatrix::new(&env).entry_point("only", std::slice::from_ref(&listed), |_| Ok(()));
+
+        let known = matrix.known_actors();
+        assert_eq!(known, vec![listed]);
+        assert!(
+            !known.contains(&never_listed),
+            "an address never listed as allowed is not a known actor"
+        );
+    }
+
+    #[test]
+    fn assert_enforced_report_states_the_known_actor_definition() {
+        let env = TestEnv::new();
+        let owner = env.address();
+        let attacker = env.address();
+
+        // `open` allows both callers (making both "known"), while `guarded`
+        // is buggy: it allows everyone. `attacker` is known from `open` and so
+        // is cross-checked against `guarded`, where it wrongly succeeds.
+        let matrix = AuthMatrix::new(&env)
+            .entry_point("open", &[owner.clone(), attacker.clone()], |_| Ok(()))
+            .entry_point("guarded", std::slice::from_ref(&owner), |_| Ok(()));
+
+        let err =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| matrix.assert_enforced()))
+                .expect_err("guarded allows everyone, so the attacker cell must be caught");
+        let message = panic_message(err);
+
+        assert!(
+            message.contains("known actors = union of all entry points' allowed lists"),
+            "the report must state the definition of a known actor: {message}"
+        );
+        assert!(
+            message.contains(&format!("{attacker:?}")),
+            "the report must name the offending known actor: {message}"
+        );
     }
 
     #[test]
